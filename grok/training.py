@@ -71,9 +71,11 @@ class TrainableTransformer(LightningModule):
             hparams.n_layers,
             hparams.n_heads,
             hparams.d_model,
+            getattr(hparams, 'dropout', 0.0),
             hparams.max_context_len,
             len(self.train_dataset.tokenizer),
             hparams.non_linearity,
+            weight_noise=getattr(hparams, 'weight_noise', 0.0),
         )
 
         self.margin = torch.Tensor([0])
@@ -104,6 +106,8 @@ class TrainableTransformer(LightningModule):
         parser.add_argument("--n_layers", type=int, default=2)
         parser.add_argument("--n_heads", type=int, default=4)
         parser.add_argument("--d_model", type=int, default=128)
+        parser.add_argument("--dropout", type=float, default=0.0)
+        parser.add_argument("--weight_noise", type=float, default=0.0)
         parser.add_argument("--non_linearity", type=str, default="relu")
         parser.add_argument("--max_context_len", type=int, default=50)
 
