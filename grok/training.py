@@ -476,8 +476,8 @@ class TrainableTransformer(LightningModule):
         lr = optimizer.param_groups[0]["lr"]
         output = {
             "loss": loss,
-            "partial_train_loss": coeff * loss,
-            "partial_train_accuracy": coeff * accuracy,
+            "partial_train_loss": loss,
+            "partial_train_accuracy": accuracy.sum(),
             "learning_rate": torch.tensor([lr]),
             "y_hat_rhs": y_hat_rhs,
             "partial_attentions": attentions,
@@ -508,7 +508,7 @@ class TrainableTransformer(LightningModule):
             )
             with torch.no_grad():
                 try:
-                    loss = torch.stack([x["partial_train_loss"] for x in full_outputs]).sum()
+                    loss = torch.stack([x["partial_train_loss"] for x in full_outputs]).mean()
                 except Exception as e:
                     print("!" * 80)
                     print(outputs)
@@ -516,7 +516,7 @@ class TrainableTransformer(LightningModule):
                 perplexity = torch.exp(loss)
                 accuracy = torch.stack(
                     [x["partial_train_accuracy"] for x in full_outputs]
-                ).sum()
+                ).mean()
             first_lr = full_outputs[0]["learning_rate"]
 
             if self.hparams.save_activations or self.hparams.save_outputs:
@@ -557,7 +557,7 @@ class TrainableTransformer(LightningModule):
                 batch=batch, batch_idx=batch_idx, train=False
             )
         output = {
-            "partial_val_loss": coeff * loss,
+            "partial_val_loss": loss,
             "partial_val_accuracy": accuracy.sum(),
             "y_hat_rhs": y_hat_rhs,
             "partial_attentions": attentions,
@@ -582,7 +582,7 @@ class TrainableTransformer(LightningModule):
                 int(1.02 * self.next_epoch_to_eval), self.next_epoch_to_eval + 1
             )
 
-            loss = torch.stack([x["partial_val_loss"] for x in outputs]).sum()
+            loss = torch.stack([x["partial_val_loss"] for x in outputs]).mean()
             perplexity = torch.exp(loss)
             accuracy = torch.stack([x["partial_val_accuracy"] for x in outputs]).sum() / len(self.val_dataset)
 
