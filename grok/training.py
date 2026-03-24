@@ -71,11 +71,9 @@ class TrainableTransformer(LightningModule):
             hparams.n_layers,
             hparams.n_heads,
             hparams.d_model,
-            hparams.dropout,
             hparams.max_context_len,
             len(self.train_dataset.tokenizer),
             hparams.non_linearity,
-            weight_noise=self.hparams.weight_noise,
         )
 
         self.margin = torch.Tensor([0])
@@ -106,8 +104,6 @@ class TrainableTransformer(LightningModule):
         parser.add_argument("--n_layers", type=int, default=2)
         parser.add_argument("--n_heads", type=int, default=4)
         parser.add_argument("--d_model", type=int, default=128)
-        parser.add_argument("--dropout", type=float, default=0.0)
-        parser.add_argument("--weight_noise", type=float, default=0.0)
         parser.add_argument("--non_linearity", type=str, default="relu")
         parser.add_argument("--max_context_len", type=int, default=50)
 
@@ -125,8 +121,7 @@ class TrainableTransformer(LightningModule):
         parser.set_defaults(anneal_lr=False)
 
         parser.add_argument("--max_lr", type=float, default=1e-3)
-        parser.add_argument("--weight_decay", type=float, default=0)
-        parser.add_argument("--weight_decay_kind", type=str, default="to_zero")
+        parser.add_argument("--weight_decay", type=float, default=1)
         parser.add_argument("--noise_factor", type=float, default=0)
 
         parser.add_argument(
@@ -251,25 +246,13 @@ class TrainableTransformer(LightningModule):
 
         :returns: optimizers and schedulers.
         """
-        optimizer = CustomAdamW(
+        optimizer = torch.optim.AdamW(
             self.parameters(),
+            lr=1,
             betas=(0.9, 0.98),
             eps=1e-8,
-            lr=1,
             weight_decay=self.hparams.weight_decay,
-            noise_factor=self.hparams.noise_factor,
-            weight_decay_form=self.hparams.weight_decay_kind,
         )
-        # optimizer = SAM(
-        #     self.parameters(),
-        #     base_optimizer=CustomAdamW,
-        #     rho=0.05,
-        #     betas=(0.9, 0.98),
-        #     eps=1e-8,
-        #     lr=1,
-        #     weight_decay=self.hparams.weight_decay,
-        #     noise_factor=self.hparams.noise_factor,
-        # )
         schedulers = [
             {
                 "scheduler": LambdaLR(optimizer, lr_lambda=self._scheduler_lr),
@@ -571,7 +554,7 @@ class TrainableTransformer(LightningModule):
             )
         output = {
             "partial_val_loss": coeff * loss,
-            "partial_val_accuracy": coeff * accuracy,
+            "partial_val_accuracy": accuracy.sum(),
             "y_hat_rhs": y_hat_rhs,
             "partial_attentions": attentions,
             "partial_values": values,
@@ -597,7 +580,7 @@ class TrainableTransformer(LightningModule):
 
             loss = torch.stack([x["partial_val_loss"] for x in outputs]).sum()
             perplexity = torch.exp(loss)
-            accuracy = torch.stack([x["partial_val_accuracy"] for x in outputs]).sum()
+            accuracy = torch.stack([x["partial_val_accuracy"] for x in outputs]).sum() / len(self.val_dataset)
 
             if self.hparams.save_activations or self.hparams.save_outputs:
                 if self.current_epoch == 0:
@@ -846,7 +829,13 @@ def compute_sharpness(hparams: Namespace, ckpts) -> None:
         "profiler": False,
         "logger": logger,
         "log_every_n_steps": 1,
+        "num_workers": 0,
+        "pin_memory": True,
+        "prefetch_factor": 2 if hparams.num_workers > 0 else None,
+        "deterministic": False,
     }
+    
+    torch.backends.cudnn.benchmark = True
     if torch.cuda.is_available() and hparams.gpu >= 0:
         if _LIGHTNING_2:
             trainer_args["accelerator"] = "gpu"
