@@ -476,8 +476,8 @@ class TrainableTransformer(LightningModule):
         lr = optimizer.param_groups[0]["lr"]
         output = {
             "loss": loss,
-            "partial_train_loss": loss,
-            "partial_train_accuracy": accuracy.sum(),
+            "partial_train_loss": coeff * loss,
+            "partial_train_accuracy": coeff * accuracy,
             "learning_rate": torch.tensor([lr]),
             "y_hat_rhs": y_hat_rhs,
             "partial_attentions": attentions,
@@ -505,7 +505,7 @@ class TrainableTransformer(LightningModule):
             self.next_train_epoch_to_log = self.current_epoch + 1  # Every epoch
             with torch.no_grad():
                 try:
-                    loss = torch.stack([x["partial_train_loss"] for x in full_outputs]).mean()
+                    loss = torch.stack([x["partial_train_loss"] for x in full_outputs]).sum()
                 except Exception as e:
                     print("!" * 80)
                     print(outputs)
@@ -513,7 +513,7 @@ class TrainableTransformer(LightningModule):
                 perplexity = torch.exp(loss)
                 accuracy = torch.stack(
                     [x["partial_train_accuracy"] for x in full_outputs]
-                ).mean()
+                ).sum()
             first_lr = full_outputs[0]["learning_rate"]
 
             if self.hparams.save_activations or self.hparams.save_outputs:
@@ -554,8 +554,8 @@ class TrainableTransformer(LightningModule):
                 batch=batch, batch_idx=batch_idx, train=False
             )
         output = {
-            "partial_val_loss": loss,
-            "partial_val_accuracy": accuracy.sum(),
+            "partial_val_loss": coeff * loss,
+            "partial_val_accuracy": coeff * accuracy,
             "y_hat_rhs": y_hat_rhs,
             "partial_attentions": attentions,
             "partial_values": values,
@@ -577,9 +577,9 @@ class TrainableTransformer(LightningModule):
         if validation_is_real:
             self.next_epoch_to_eval = self.current_epoch + 1  # Every epoch
 
-            loss = torch.stack([x["partial_val_loss"] for x in outputs]).mean()
+            loss = torch.stack([x["partial_val_loss"] for x in outputs]).sum()
             perplexity = torch.exp(loss)
-            accuracy = torch.stack([x["partial_val_accuracy"] for x in outputs]).sum() / len(self.val_dataset)
+            accuracy = torch.stack([x["partial_val_accuracy"] for x in outputs]).sum()
 
             if self.hparams.save_activations or self.hparams.save_outputs:
                 if self.current_epoch == 0:
@@ -732,7 +732,7 @@ def train(hparams: Namespace) -> None:
         "max_steps": hparams.max_steps,
         "min_steps": None,
         "max_epochs": -1 if (hparams.max_steps is not None and hparams.max_steps > 0) else int(1e8),
-        "val_check_interval": 1,
+        "val_check_interval": 1.0,  # Run once per epoch
         "profiler": False,
         # "checkpoint_callback": checkpointer,
         "logger": logger,
@@ -824,7 +824,7 @@ def compute_sharpness(hparams: Namespace, ckpts) -> None:
         "max_steps": hparams.max_steps,
         "min_steps": None,
         "max_epochs": -1 if (hparams.max_steps is not None and hparams.max_steps > 0) else int(1e8),
-        "val_check_interval": 1,
+        "val_check_interval": 1.0,  # Run once per epoch
         "profiler": False,
         "logger": logger,
         "log_every_n_steps": 1,
