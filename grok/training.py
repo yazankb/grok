@@ -468,9 +468,9 @@ class TrainableTransformer(LightningModule):
         )
         self.fwd_time_in_epoch += time.time() - start
 
-        if self.current_epoch != self.next_train_epoch_to_log:
-            self._train_step_outputs.append({"loss": loss})
-            return {"loss": loss}
+        # Log every epoch (removed exponential backoff for training)
+        self._train_step_outputs.append({"loss": loss})
+        self.next_train_epoch_to_log = self.current_epoch + 1  # Log every epoch
         opt = self.optimizers()
         optimizer = opt[0] if isinstance(opt, list) else opt
         lr = optimizer.param_groups[0]["lr"]
@@ -496,8 +496,8 @@ class TrainableTransformer(LightningModule):
         """
         outputs = self._train_step_outputs
         self._train_step_outputs = []
-        epoch_is_to_be_logged = self.current_epoch == self.next_train_epoch_to_log
-        if epoch_is_to_be_logged and len(outputs) > 0:
+        # Compute metrics every epoch (removed exponential backoff)
+        if len(outputs) > 0:
             # Only use outputs that have full logging data (from steps when we logged)
             full_outputs = [x for x in outputs if "partial_train_loss" in x]
             if len(full_outputs) == 0:
