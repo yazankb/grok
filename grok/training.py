@@ -502,10 +502,7 @@ class TrainableTransformer(LightningModule):
             full_outputs = [x for x in outputs if "partial_train_loss" in x]
             if len(full_outputs) == 0:
                 return
-            self.next_train_epoch_to_log = max(
-                int(1.01 * self.next_train_epoch_to_log),
-                self.next_train_epoch_to_log + 1,
-            )
+            self.next_train_epoch_to_log = self.current_epoch + 1  # Every epoch
             with torch.no_grad():
                 try:
                     loss = torch.stack([x["partial_train_loss"] for x in full_outputs]).mean()
@@ -578,9 +575,7 @@ class TrainableTransformer(LightningModule):
         validation_is_real = len(outputs) > 0 and len(outputs[0]) != 0
 
         if validation_is_real:
-            self.next_epoch_to_eval = max(
-                int(1.02 * self.next_epoch_to_eval), self.next_epoch_to_eval + 1
-            )
+            self.next_epoch_to_eval = self.current_epoch + 1  # Every epoch
 
             loss = torch.stack([x["partial_val_loss"] for x in outputs]).mean()
             perplexity = torch.exp(loss)
