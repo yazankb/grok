@@ -71,11 +71,9 @@ class TrainableTransformer(LightningModule):
             hparams.n_layers,
             hparams.n_heads,
             hparams.d_model,
-            getattr(hparams, 'dropout', 0.0),
             hparams.max_context_len,
             len(self.train_dataset.tokenizer),
             hparams.non_linearity,
-            weight_noise=getattr(hparams, 'weight_noise', 0.0),
         )
 
         self.margin = torch.Tensor([0])
@@ -106,8 +104,6 @@ class TrainableTransformer(LightningModule):
         parser.add_argument("--n_layers", type=int, default=2)
         parser.add_argument("--n_heads", type=int, default=4)
         parser.add_argument("--d_model", type=int, default=128)
-        parser.add_argument("--dropout", type=float, default=0.0)
-        parser.add_argument("--weight_noise", type=float, default=0.0)
         parser.add_argument("--non_linearity", type=str, default="relu")
         parser.add_argument("--max_context_len", type=int, default=50)
 
@@ -126,6 +122,7 @@ class TrainableTransformer(LightningModule):
 
         parser.add_argument("--max_lr", type=float, default=1e-3)
         parser.add_argument("--weight_decay", type=float, default=1)
+        parser.add_argument("--weight_decay_kind", type=str, default="to_zero")
         parser.add_argument("--noise_factor", type=float, default=0)
 
         parser.add_argument(
@@ -250,12 +247,14 @@ class TrainableTransformer(LightningModule):
 
         :returns: optimizers and schedulers.
         """
-        optimizer = torch.optim.AdamW(
+        optimizer = CustomAdamW(
             self.parameters(),
-            lr=1,
             betas=(0.9, 0.98),
             eps=1e-8,
+            lr=1,
             weight_decay=self.hparams.weight_decay,
+            noise_factor=self.hparams.noise_factor,
+            weight_decay_form=self.hparams.weight_decay_kind,
         )
         schedulers = [
             {
@@ -468,7 +467,6 @@ class TrainableTransformer(LightningModule):
         )
         self.fwd_time_in_epoch += time.time() - start
 
-        # Log at exponentially spaced epochs (matches paper)
         if self.current_epoch != self.next_train_epoch_to_log:
             self._train_step_outputs.append({"loss": loss})
             return {"loss": loss}
@@ -497,9 +495,9 @@ class TrainableTransformer(LightningModule):
         """
         outputs = self._train_step_outputs
         self._train_step_outputs = []
-        # Exponential backoff for training logging (matches paper)
         epoch_is_to_be_logged = self.current_epoch == self.next_train_epoch_to_log
         if epoch_is_to_be_logged and len(outputs) > 0:
+            # Only use outputs that have full logging data (from steps when we logged)
             full_outputs = [x for x in outputs if "partial_train_loss" in x]
             if len(full_outputs) == 0:
                 return
@@ -559,7 +557,7 @@ class TrainableTransformer(LightningModule):
             )
         output = {
             "partial_val_loss": coeff * loss,
-            "partial_val_accuracy": coeff * accuracy,
+            "partial_val_accuracy": accuracy.sum(),
             "y_hat_rhs": y_hat_rhs,
             "partial_attentions": attentions,
             "partial_values": values,
@@ -585,7 +583,7 @@ class TrainableTransformer(LightningModule):
 
             loss = torch.stack([x["partial_val_loss"] for x in outputs]).sum()
             perplexity = torch.exp(loss)
-            accuracy = torch.stack([x["partial_val_accuracy"] for x in outputs]).sum()
+            accuracy = torch.stack([x["partial_val_accuracy"] for x in outputs]).sum() / len(self.val_dataset)
 
             if self.hparams.save_activations or self.hparams.save_outputs:
                 if self.current_epoch == 0:
@@ -736,14 +734,13 @@ def train(hparams: Namespace) -> None:
     # so Lightning stops exactly at max_steps (avoids epoch-boundary behavior).
     trainer_args = {
         "max_steps": hparams.max_steps,
-        "min_steps": hparams.max_steps,
-        "max_epochs": int(1e8),
+        "min_steps": None,
+        "max_epochs": -1 if (hparams.max_steps is not None and hparams.max_steps > 0) else int(1e8),
         "val_check_interval": 1,
         "profiler": False,
         # "checkpoint_callback": checkpointer,
         "logger": logger,
         "log_every_n_steps": 1,
-        "flush_logs_every_n_steps": 1000,
     }
     if torch.cuda.is_available() and hparams.gpu >= 0:
         if _LIGHTNING_2:
@@ -829,13 +826,12 @@ def compute_sharpness(hparams: Namespace, ckpts) -> None:
 
     trainer_args = {
         "max_steps": hparams.max_steps,
-        "min_steps": hparams.max_steps,
-        "max_epochs": int(1e8),
+        "min_steps": None,
+        "max_epochs": -1 if (hparams.max_steps is not None and hparams.max_steps > 0) else int(1e8),
         "val_check_interval": 1,
         "profiler": False,
         "logger": logger,
         "log_every_n_steps": 1,
-        "flush_logs_every_n_steps": 1000,
     }
     if torch.cuda.is_available() and hparams.gpu >= 0:
         if _LIGHTNING_2:
