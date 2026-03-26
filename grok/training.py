@@ -581,7 +581,7 @@ class TrainableTransformer(LightningModule):
 
             loss = torch.stack([x["partial_val_loss"] for x in outputs]).sum()
             perplexity = torch.exp(loss)
-            accuracy = torch.stack([x["partial_val_accuracy"] for x in outputs]).sum() / len(self.val_dataset)
+            accuracy = torch.stack([x["partial_val_accuracy"] for x in outputs]).sum()
 
             if self.hparams.save_activations or self.hparams.save_outputs:
                 if self.current_epoch == 0:
