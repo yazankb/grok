@@ -283,7 +283,7 @@ if __name__ == "__main__":
     parser.set_defaults(logdir=os.path.join(os.getcwd(), "logs"), datadir=os.path.join(os.getcwd(), "data"),
                         math_operator="/", train_data_pct=50, n_models=4, specialist_steps=50000,
                         final_steps=100000, distill_steps=50000, distill_temperature=2.0, distill_alpha=0.5,
-                        experiment_name="full_experiment", random_seed=42)
+                        experiment_name="full_experiment", random_seed=42, gpu=-1)
     hparams = parser.parse_args()
     hparams.datadir = os.path.normpath(hparams.datadir)
     hparams.logdir = os.path.normpath(hparams.logdir)
