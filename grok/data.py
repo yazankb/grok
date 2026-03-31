@@ -183,17 +183,6 @@ class ArithmeticDataset:
         :returns: total number of equations in this dataset
         """
         return self.data.shape[0]
-    
-    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        """
-        Get a single item from the dataset.
-        
-        :param idx: Index of the item
-        :returns: Dict with 'text' and 'target' tensors
-        """
-        text = self.data[idx, :-1]
-        target = self.data[idx, 1:]
-        return {"text": text, "target": target}
 
     # @classmethod
     # def _render(cls, operand):
@@ -509,9 +498,9 @@ class ArithmeticIterator(torch.utils.data.IterableDataset):
             self.reset_iteration()
             raise StopIteration
         indices = self.permutation[batch_begin : batch_begin + self.batchsize]
-        text = self.dataset.data[indices, :-1].to(self.device, non_blocking=True)
-        target = self.dataset.data[indices, 1:].to(self.device, non_blocking=True)
-        batch = {"text": text, "target": target}
+        text = self.dataset.data[indices, :-1]
+        target = self.dataset.data[indices, 1:]
+        batch = {"text": text.to(self.device), "target": target.to(self.device)}
         self.index += 1
         return batch
 

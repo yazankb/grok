@@ -71,9 +71,11 @@ class TrainableTransformer(LightningModule):
             hparams.n_layers,
             hparams.n_heads,
             hparams.d_model,
+            hparams.dropout if hasattr(hparams, 'dropout') else 0.0,
             hparams.max_context_len,
             len(self.train_dataset.tokenizer),
             hparams.non_linearity,
+            weight_noise=self.hparams.weight_noise if hasattr(hparams, 'weight_noise') else 0.0,
         )
 
         self.margin = torch.Tensor([0])
@@ -104,6 +106,8 @@ class TrainableTransformer(LightningModule):
         parser.add_argument("--n_layers", type=int, default=2)
         parser.add_argument("--n_heads", type=int, default=4)
         parser.add_argument("--d_model", type=int, default=128)
+        parser.add_argument("--dropout", type=float, default=0.0)
+        parser.add_argument("--weight_noise", type=float, default=0.0)
         parser.add_argument("--non_linearity", type=str, default="relu")
         parser.add_argument("--max_context_len", type=int, default=50)
 
@@ -114,7 +118,7 @@ class TrainableTransformer(LightningModule):
             help="for list operations, the length of the lists",
         )
 
-        parser.add_argument("--train_data_pct", type=float, default=5)
+        parser.add_argument("--train_data_pct", type=float, default=50)
         parser.add_argument("--warmup_steps", type=int, default=10)
         parser.add_argument("--anneal_lr_steps", type=int, default=100000)
         parser.add_argument("--anneal_lr", dest="anneal_lr", action="store_true")
@@ -247,12 +251,14 @@ class TrainableTransformer(LightningModule):
 
         :returns: optimizers and schedulers.
         """
-        optimizer = torch.optim.AdamW(
+        optimizer = CustomAdamW(
             self.parameters(),
-            lr=1,
             betas=(0.9, 0.98),
             eps=1e-8,
+            lr=1,
             weight_decay=self.hparams.weight_decay,
+            noise_factor=self.hparams.noise_factor if hasattr(self.hparams, 'noise_factor') else 0,
+            weight_decay_form=self.hparams.weight_decay_kind if hasattr(self.hparams, 'weight_decay_kind') else "to_zero",
         )
         schedulers = [
             {
@@ -455,6 +461,10 @@ class TrainableTransformer(LightningModule):
         :returns: a dict with loss, accuracy, lr, probabilities of solutions,
                   attentions, and values
         """
+        global_step = self.global_step
+        if global_step > 0 and global_step % 1000 == 0:
+            print(f"  [Step {global_step}] Training in progress...")
+        
         if batch_idx == 0:
             self.training_epoch_start_time = time.time()
             self.fwd_time_in_epoch = 0
@@ -555,7 +565,7 @@ class TrainableTransformer(LightningModule):
             )
         output = {
             "partial_val_loss": coeff * loss,
-            "partial_val_accuracy": accuracy.sum(),
+            "partial_val_accuracy": coeff * accuracy,
             "y_hat_rhs": y_hat_rhs,
             "partial_attentions": attentions,
             "partial_values": values,
@@ -732,11 +742,10 @@ def train(hparams: Namespace) -> None:
     # so Lightning stops exactly at max_steps (avoids epoch-boundary behavior).
     trainer_args = {
         "max_steps": hparams.max_steps,
-        "min_steps": None,
-        "max_epochs": -1 if (hparams.max_steps is not None and hparams.max_steps > 0) else int(1e8),
+        "min_steps": hparams.max_steps,
+        "max_epochs": int(1e8),
         "val_check_interval": 1,
         "profiler": False,
-        # "checkpoint_callback": checkpointer,
         "logger": logger,
         "log_every_n_steps": 1,
     }
@@ -824,8 +833,8 @@ def compute_sharpness(hparams: Namespace, ckpts) -> None:
 
     trainer_args = {
         "max_steps": hparams.max_steps,
-        "min_steps": None,
-        "max_epochs": -1 if (hparams.max_steps is not None and hparams.max_steps > 0) else int(1e8),
+        "min_steps": hparams.max_steps,
+        "max_epochs": int(1e8),
         "val_check_interval": 1,
         "profiler": False,
         "logger": logger,
@@ -878,8 +887,7 @@ def add_args(parser=None) -> ArgumentParser:
     parser.add_argument("--random_seed", type=int, default=-1)
     parser.add_argument("--gpu", type=int, default=0)
     parser.add_argument("--max_epochs", type=int, default=None)
-    parser.add_argument("--max_steps", type=int, default=500)
-    # parser.add_argument("--checkpoint_period", type=int, default=1)
+    parser.add_argument("--max_steps", type=int, default=100000)
     parser = TrainableTransformer.add_model_specific_args(parser)
     return parser
 
