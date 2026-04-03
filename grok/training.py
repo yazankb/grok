@@ -555,9 +555,11 @@ class TrainableTransformer(LightningModule):
         :returns: a dict with val_loss, val_accuracy, probabilities of solutions,
                   attentions, and values
         """
+        # Unconditionally advance next_epoch_to_eval so it never gets stuck
         if self.next_epoch_to_eval < self.current_epoch:
             self.next_epoch_to_eval = self.current_epoch
         if self.current_epoch != self.next_epoch_to_eval:
+            self._val_step_outputs.append({})
             return {}
         with torch.no_grad():
             loss, accuracy, coeff, x_lhs, y_hat_rhs, attentions, values = self._step(
@@ -585,10 +587,6 @@ class TrainableTransformer(LightningModule):
         validation_is_real = len(outputs) > 0 and len(outputs[0]) != 0
 
         if validation_is_real:
-            self.next_epoch_to_eval = max(
-                int(1.02 * self.next_epoch_to_eval), self.next_epoch_to_eval + 1
-            )
-
             loss = torch.stack([x["partial_val_loss"] for x in outputs]).sum()
             perplexity = torch.exp(loss)
             accuracy = torch.stack([x["partial_val_accuracy"] for x in outputs]).sum()
@@ -628,9 +626,13 @@ class TrainableTransformer(LightningModule):
             and int(2 ** (int(np.log(self.current_epoch) / np.log(2))))
             == self.current_epoch
         ):
+            ckpt_path = getattr(self.hparams, "checkpoint_path", None) or os.path.join(
+                self.hparams.logdir, "checkpoints"
+            )
+            os.makedirs(ckpt_path, exist_ok=True)
             self.trainer.save_checkpoint(
                 os.path.join(
-                    self.hparams.checkpoint_path,
+                    ckpt_path,
                     "epoch_" + str(self.current_epoch) + ".ckpt",
                 )
             )

@@ -33,7 +33,7 @@ _LIGHTNING_2 = (
     and int(pl.__version__.split(".")[0]) >= 2
 )
 
-from grok.data import ArithmeticDataset
+from grok.data import ArithmeticDataset, ArithmeticIterator
 from grok.training import DEFAULT_LOG_DIR, TrainableTransformer, add_args
 from grok.transformer import Transformer
 
@@ -160,6 +160,17 @@ class DistillationTrainer:
             targets.reshape(-1).to(self.device)
         )
     
+    @staticmethod
+    def _rhs_accuracy(logits: torch.Tensor, targets: torch.Tensor, eq_token_id: int) -> torch.Tensor:
+        """Compute accuracy only on the RHS (answer) tokens after '='."""
+        y_hat = logits.transpose(-2, -1)  # batchsize, vocab_size, context_len
+        eq_pos = int(torch.nonzero(targets[0, :] == eq_token_id, as_tuple=False)[0].squeeze())
+        y_hat_rhs = y_hat[..., eq_pos + 1:]
+        y_rhs = targets[..., eq_pos + 1:]
+        y_pred = torch.max(y_hat_rhs, dim=-2).indices
+        row_acc = torch.min((y_pred == y_rhs), dim=-1).values
+        return row_acc.float().mean() * 100
+
     def train_step(self, batch: Dict) -> Tuple[torch.Tensor, Dict]:
         """
         Single distillation training step.
@@ -171,23 +182,22 @@ class DistillationTrainer:
         student_logits, _, _ = self.student(text)
         teacher_logits = self.get_teacher_logits({"text": text})
         
-        # Combined loss
+        # Combined loss (on all tokens, same as Lightning _step)
         soft_loss = self.distillation_loss(student_logits, teacher_logits)
         hard_loss = self.hard_loss(student_logits, targets)
         loss = self.alpha * soft_loss + (1 - self.alpha) * hard_loss
         
-        # Accuracy
+        # RHS-only accuracy (matches Lightning _accuracy)
+        eq_token_id = self.student.train_dataset.tokenizer.stoi["="]
         with torch.no_grad():
-            student_pred = student_logits.argmax(dim=-1)
-            accuracy = (student_pred == targets).float().mean() * 100
-            teacher_pred = teacher_logits.argmax(dim=-1)
-            teacher_acc = (teacher_pred == targets).float().mean() * 100
+            student_acc = self._rhs_accuracy(student_logits, targets, eq_token_id)
+            teacher_acc = self._rhs_accuracy(teacher_logits.to(student_logits.device), targets, eq_token_id)
         
         metrics = {
             "loss": loss.item(),
             "soft_loss": soft_loss.item(),
             "hard_loss": hard_loss.item(),
-            "student_acc": accuracy.item(),
+            "student_acc": student_acc.item(),
             "teacher_acc": teacher_acc.item(),
         }
         return loss, metrics
@@ -221,18 +231,16 @@ def distill_from_specialists(
         device=device,
     )
     
-    # Create dataloaders
-    train_loader = torch.utils.data.DataLoader(
-        train_dataset, 
-        batch_size=64,
-        shuffle=True,
-        num_workers=0,
+    # Create iterators
+    train_loader = ArithmeticIterator(
+        train_dataset,
+        device,
+        batchsize_hint=64,
     )
-    val_loader = torch.utils.data.DataLoader(
+    val_loader = ArithmeticIterator(
         val_dataset,
-        batch_size=256,
-        shuffle=False,
-        num_workers=0,
+        device,
+        batchsize_hint=256,
     )
     
     optimizer = torch.optim.AdamW(
@@ -255,60 +263,109 @@ def distill_from_specialists(
     student_model = student_model.train()
     
     while step < distill_steps:
-        for batch in train_loader:
-            if step >= distill_steps:
-                break
+        train_loader.reset_iteration()
+        try:
+            for batch in train_loader:
+                if step >= distill_steps:
+                    break
+                    
+                optimizer.zero_grad()
+                loss, m = distill_trainer.train_step(batch)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(student_model.parameters(), 1.0)
+                optimizer.step()
+                scheduler.step()
                 
-            optimizer.zero_grad()
-            loss, m = distill_trainer.train_step(batch)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(student_model.parameters(), 1.0)
-            optimizer.step()
-            scheduler.step()
-            
-            metrics["loss"].append(m["loss"])
-            metrics["soft_loss"].append(m["soft_loss"])
-            metrics["hard_loss"].append(m["hard_loss"])
-            metrics["student_acc"].append(m["student_acc"])
-            metrics["teacher_acc"].append(m["teacher_acc"])
-            metrics["steps"].append(step)
-            
-            step += 1
-            
-            if step % 500 == 0:
-                # Validate
-                student_model.eval()
-                correct = 0
-                total = 0
-                with torch.no_grad():
-                    for val_batch in val_loader:
-                        logits, _, _ = student_model(val_batch["text"].to(device))
-                        preds = logits.argmax(dim=-1)
-                        targets = val_batch["target"].to(device)
-                        correct += (preds == targets).sum().item()
-                        total += targets.numel()
-                val_acc = correct / total * 100 if total > 0 else 0
-                metrics["val_acc"].append(val_acc)
-                student_model.train()
+                metrics["loss"].append(m["loss"])
+                metrics["soft_loss"].append(m["soft_loss"])
+                metrics["hard_loss"].append(m["hard_loss"])
+                metrics["student_acc"].append(m["student_acc"])
+                metrics["teacher_acc"].append(m["teacher_acc"])
+                metrics["steps"].append(step)
                 
-                print(f"  Step {step}/{distill_steps}: "
-                      f"train_acc={m['student_acc']:.2f}%, "
-                      f"val_acc={val_acc:.2f}%, "
-                      f"loss={m['loss']:.4f}")
+                step += 1
+                
+                if step % 1000 == 0:
+                    print(f"  [Distillation Step {step}/{distill_steps}]")
+                
+                if step % 500 == 0:
+                    # Validate (RHS-only accuracy)
+                    student_model.eval()
+                    correct = 0
+                    total = 0
+                    eq_token_id = student_model.train_dataset.tokenizer.stoi["="]
+                    val_loader.reset_iteration()
+                    with torch.no_grad():
+                        for val_batch in val_loader:
+                            val_text = val_batch["text"].to(device)
+                            val_target = val_batch["target"].to(device)
+                            logits, _, _ = student_model(val_text)
+                            y_hat = logits.transpose(-2, -1)
+                            eq_pos = int(torch.nonzero(val_target[0, :] == eq_token_id, as_tuple=False)[0].squeeze())
+                            y_hat_rhs = y_hat[..., eq_pos + 1:]
+                            y_rhs = val_target[..., eq_pos + 1:]
+                            preds = torch.max(y_hat_rhs, dim=-2).indices
+                            row_acc = torch.min((preds == y_rhs), dim=-1).values
+                            correct += row_acc.sum().item()
+                            total += len(row_acc)
+                    val_acc = correct / total * 100 if total > 0 else 0
+                    metrics["val_acc"].append(val_acc)
+                    student_model.train()
+                    
+                    print(f"  Step {step}/{distill_steps}: "
+                          f"train_acc={m['student_acc']:.2f}%, "
+                          f"val_acc={val_acc:.2f}%, "
+                          f"loss={m['loss']:.4f}")
+        except StopIteration:
+            pass
     
-    # Final validation
+    # Final validation (RHS-only accuracy)
     student_model.eval()
     correct = 0
     total = 0
+    eq_token_id = student_model.train_dataset.tokenizer.stoi["="]
+    val_loader.reset_iteration()
     with torch.no_grad():
         for val_batch in val_loader:
-            logits, _, _ = student_model(val_batch["text"].to(device))
-            preds = logits.argmax(dim=-1)
-            targets = val_batch["target"].to(device)
-            correct += (preds == targets).sum().item()
-            total += targets.numel()
+            val_text = val_batch["text"].to(device)
+            val_target = val_batch["target"].to(device)
+            logits, _, _ = student_model(val_text)
+            y_hat = logits.transpose(-2, -1)
+            eq_pos = int(torch.nonzero(val_target[0, :] == eq_token_id, as_tuple=False)[0].squeeze())
+            y_hat_rhs = y_hat[..., eq_pos + 1:]
+            y_rhs = val_target[..., eq_pos + 1:]
+            preds = torch.max(y_hat_rhs, dim=-2).indices
+            row_acc = torch.min((preds == y_rhs), dim=-1).values
+            correct += row_acc.sum().item()
+            total += len(row_acc)
     final_val_acc = correct / total * 100 if total > 0 else 0
     print(f"  Final distillation val_acc: {final_val_acc:.2f}%")
+    
+    # Save distillation metrics as CSV for plotting
+    import csv as csv_mod
+    csv_path = os.path.join(log_dir, "distill_metrics.csv")
+    os.makedirs(log_dir, exist_ok=True)
+    with open(csv_path, "w", newline="") as fh:
+        writer = csv_mod.writer(fh)
+        writer.writerow(["step", "loss", "soft_loss", "hard_loss", "student_acc", "teacher_acc"])
+        for i in range(len(metrics["steps"])):
+            writer.writerow([
+                metrics["steps"][i],
+                metrics["loss"][i],
+                metrics["soft_loss"][i],
+                metrics["hard_loss"][i],
+                metrics["student_acc"][i],
+                metrics["teacher_acc"][i],
+            ])
+    # Save val accuracy separately (sampled every 500 steps)
+    val_csv_path = os.path.join(log_dir, "distill_val_metrics.csv")
+    with open(val_csv_path, "w", newline="") as fh:
+        writer = csv_mod.writer(fh)
+        writer.writerow(["step", "val_accuracy"])
+        val_steps = list(range(500, len(metrics["steps"]), 500))[:len(metrics["val_acc"])]
+        for s, v in zip(val_steps, metrics["val_acc"]):
+            writer.writerow([s, v])
+    print(f"  Distillation metrics saved to {csv_path}")
     
     return student_model, metrics
 
@@ -635,7 +692,9 @@ def train_multi_with_distillation(hparams: Namespace) -> str:
             min_steps=1,
             extra_callbacks=callbacks,
         )
+        print(f"  Starting specialist {i} training for {specialist_steps} steps...")
         trainer.fit(model)
+        print(f"  Finished specialist {i} training")
 
         specialist_models.append(model)
         print(f"  Specialist {i} done")
