@@ -380,7 +380,7 @@ def _build_trainer(
     max_steps: int,
     min_steps: int = 1,
     extra_callbacks: Optional[List[Callback]] = None,
-    check_val_every_n_epoch: int = 25,
+    check_val_every_n_epoch: int = 1,
 ) -> Trainer:
     logger = CSVLogger(log_dir)
     trainer_args = {

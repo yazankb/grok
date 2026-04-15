@@ -12,15 +12,15 @@ Example (from repo root):
         --overfit_threshold 0.99 \
         --experiment_name multi_exp_1
 
-With distillation:
+    # With distillation:
     python scripts/train_multi.py \
         --n_models 4 \
         --train_data_pct 50 \
-        --specialist_steps 10000 \
-        --final_steps 50000 \
+        --specialist_steps 50000 \
+        --final_steps 100000 \
         --use_distillation \
-        --distill_steps 25000 \
-        --experiment_name distill_exp_1
+        --distill_steps 50000 \
+        --experiment_name multi_exp_distill
 
 All base training flags (--math_operator, --n_layers, --d_model, etc.) are
 also accepted and forwarded to each model.
@@ -54,6 +54,7 @@ hparams.logdir = (
 
 print(hparams)
 
+# Use distillation if requested
 if getattr(hparams, "use_distillation", False):
     print(train_multi_with_distillation(hparams))
 else:

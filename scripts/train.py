@@ -2,15 +2,25 @@
 
 import grok
 import os
+import argparse
 
-# Use cwd as project root so paths have correct encoding (avoid __file__ encoding issues)
 _project_root = os.getcwd()
 
 parser = grok.training.add_args()
-parser.set_defaults(
-    logdir=os.environ.get("GROK_LOGDIR", os.path.join(_project_root, "logs")),
-    datadir=os.path.join(_project_root, "data"),
-)
+    parser.set_defaults(
+        logdir=os.environ.get("GROK_LOGDIR", os.path.join(_project_root, "logs")),
+        datadir=os.path.join(_project_root, "data"),
+        math_operator="/",
+        train_data_pct=50,
+        max_steps=100000,
+        weight_decay=1,
+        n_layers=2,
+        n_heads=4,
+        d_model=128,
+        max_lr=1e-3,
+        warmup_steps=10,
+        random_seed=42,
+    )
 hparams = parser.parse_args()
 hparams.datadir = os.path.join(_project_root, hparams.datadir) if not os.path.isabs(hparams.datadir) else hparams.datadir
 hparams.datadir = os.path.normpath(hparams.datadir)

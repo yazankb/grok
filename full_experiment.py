@@ -171,8 +171,8 @@ def distill_from_specialists(specialist_models: List[TrainableTransformer], stud
 
 def _build_trainer(hparams: Namespace, log_dir: str, max_steps: int, min_steps: int = 1,
                    extra_callbacks: Optional[List[Callback]] = None, check_val_every_n_epoch: int = 25) -> Trainer:
-    logger = CSVLogger(log_dir)
-    trainer_args = {"max_steps": max_steps, "min_steps": min_steps, "max_epochs": int(1e8),
+    logger = CSVLogger(log_dir, flush_logs_every_n_steps=1)
+    trainer_args = {"max_steps": max_steps, "min_steps": min_steps, "max_epochs": int(1e9),
                     "check_val_every_n_epoch": check_val_every_n_epoch, "logger": logger,
                     "log_every_n_steps": 1, "callbacks": extra_callbacks or []}
     if torch.cuda.is_available() and hparams.gpu >= 0:

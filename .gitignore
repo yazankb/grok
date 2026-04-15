@@ -135,3 +135,24 @@ checkpoints
 # Experiment outputs (regenerate with scripts)
 logs/
 lightning_logs/
+
+2201.02177v1.pdf
+YazanKbaili_AliSalloum.pdf
+accuracy1.png
+accuracy2.png
+accuracy3.png
+dashboard1.png
+dashboard2.png
+dashboard3.png
+dest/
+grok_test_run/
+kaggle.json
+multi_experiment_docs.md
+multi_model_grokking_report.md
+nul
+reports/MultiModel_Grokking_Report_Mar2026.pdf
+reports/build_report_pdf.py
+reports/grokking_curves_5k.png
+run_paper_baseline.py
+run_paper_exact.py
+scripts/plot_100steps.py
