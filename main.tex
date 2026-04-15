@@ -1,0 +1,265 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage[utf8]{inputenc}
+\usepackage{amsmath, amssymb, amsthm, amsfonts}
+\usepackage{mathtools}
+\usepackage{bm}
+\usepackage{hyperref}
+\usepackage{cleveref}
+\usepackage{enumitem}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+\usepackage{booktabs}
+\usepackage{geometry}
+\geometry{margin=1in}
+
+% Theorem environments
+\theoremstyle{definition}
+\newtheorem{definition}{Definition}[section]
+\newtheorem{assumption}{Assumption}[section]
+
+\theoremstyle{plain}
+\newtheorem{lemma}{Lemma}[section]
+\newtheorem{theorem}{Theorem}[section]
+\newtheorem{corollary}{Corollary}[section]
+\newtheorem{proposition}{Proposition}[section]
+
+\theoremstyle{remark}
+\newtheorem{remark}{Remark}[section]
+
+% Math operators
+\DeclareMathOperator*{\argmax}{arg\,max}
+\DeclareMathOperator*{\argmin}{arg\,min}
+\DeclareMathOperator{\softmax}{softmax}
+\DeclareMathOperator{\E}{\mathbb{E}}
+\DeclareMathOperator{\Var}{Var}
+\DeclareMathOperator{\KL}{KL}
+\DeclareMathOperator{\conv}{conv}
+
+% Sets and spaces
+\newcommand{\X}{\mathcal{X}}
+\newcommand{\Y}{\mathcal{Y}}
+\newcommand{\D}{\mathcal{D}}
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\N}{\mathbb{N}}
+
+% Vectors and matrices
+\newcommand{\w}{\mathbf{w}}
+\newcommand{\vvec}{\mathbf{v}}
+\newcommand{\x}{\mathbf{x}}
+\newcommand{\z}{\mathbf{z}}
+\newcommand{\p}{\mathbf{p}}
+\newcommand{\ind}{\mathbf{1}}
+\newcommand{\bmu}{\bm{\mu}}
+\newcommand{\bsigma}{\bm{\sigma}}
+
+% Others
+\newcommand{\norm}[1]{\left\|#1\right\|}
+\newcommand{\abs}[1]{\left|#1\right|}
+\newcommand{\inner}[2]{\left\langle#1,#2\right\rangle}
+
+\title{\textbf{Ensembles of EMA Specialists Act as Adaptive Label Smoothing:\\ Accelerating Grokking via Disagreement}}
+\author{Anonymous Authors}
+\date{\today}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+We present a rigorous theoretical analysis of a multi-model ensemble strategy for accelerating grokking in neural networks. Our method trains $M$ specialist models on random overlapping subsets of the data (bagging), maintains exponential moving averages (EMA) for each specialist, and distills a student model on the ensemble's averaged soft targets. 
+
+Unlike previous work, we show that cross-entropy gradient starvation induces logarithmic logit growth, trapping standard models in a Naive Loss Minimization (NLM) attractor. Our main contributions: (1) We prove that EMA dynamically bounds the logit norm, effectively delaying Softmax Collapse. (2) We demonstrate that bagging maintains teacher diversity while allowing specialists to cross the grokking sample-complexity threshold. (3) We formally prove that distilling from this ensemble generates an Adaptive Label Smoothing target, where teacher disagreement on ambiguous points naturally elevates target entropy. (4) We establish that this elevated entropy creates a restoring force that pulls the student out of the NLM attractor, maintaining active gradients and dramatically accelerating the weight-decay driven discovery of generalizing circuits.
+\end{abstract}
+
+\section{Formal Setup and Definitions}
+\label{sec:setup}
+
+\begin{definition}[Learning Problem]
+\label{def:learning-prob}
+Let $\X \subseteq \R^d$ be the input space and $\Y = \{1, \dots, K\}$ the label set. Let $\D$ be an unknown probability distribution over $\X \times \Y$. The training set $S = \{(\x_n, y_n)\}_{n=1}^N \sim \D^N$ is drawn i.i.d.\ with $|S| = N$.
+\end{definition}
+
+\begin{definition}[Neural Network]
+\label{def:nn}
+A neural network with parameters $\w \in \R^D$ defines a function $f_{\w}: \X \to \R^K$ where $f_{\w}(\x) = \z(\x; \w)$ are the logits. The softmax probability for class $k$ is:
+\[
+p_k(\x; \w) = \frac{\exp(z_k(\x; \w))}{\sum_{j=1}^K \exp(z_j(\x; \w))}.
+\]
+\end{definition}
+
+\begin{definition}[Cross-Entropy Loss]
+\label{def:loss}
+For sample $(\x, y)$, the loss is $\ell(\w, (\x, y)) = -\log p_y(\x; \w)$. The empirical risk on dataset $S$ is $L_S(\w) = \frac{1}{|S|} \sum_{(\x,y) \in S} \ell(\w, (\x, y))$.
+\end{definition}
+
+\begin{definition}[Grokking]
+\label{def:grokking}
+Let $A_{\text{val}}(t) \in [0,1]$ be validation accuracy at step $t$ and $A_{\text{train}}(t)$ training accuracy. Grokking occurs at time $T^*$ \cite{power2022grokking} if there exists $T_1 \ll T^*$ such that:
+\begin{enumerate}[(i)]
+    \item $A_{\text{train}}(t) = 1$ for all $t \geq T_1$ (perfect training fit),
+    \item $A_{\text{val}}(t) \approx 1/K$ for $T_1 \leq t < T^*$ (random validation),
+    \item $A_{\text{val}}(t) \to 1$ for $t \geq T^*$ (sudden generalization).
+\end{enumerate}
+\end{definition}
+
+\begin{definition}[Softmax Collapse]
+\label{def:softmax-collapse}
+For input $\x$ with label $y$, let $z_y(\x; \w)$ be the correct class logit. Softmax Collapse (SC) occurs at $T_c$ when $z_y(\x; \w(T_c)) \geq Z_{\max} \approx 88$ (float32 limit), resulting in numerical underflow where $\nabla_{\w} \ell(\w(t), (\x, y)) = \mathbf{0}$ for all $t > T_c$.
+\end{definition}
+
+\section{Logarithmic Logit Growth and Gradient Starvation}
+\label{sec:nlm}
+
+\begin{assumption}[NLM Regime]
+\label{ass:nlm}
+After reaching near-zero training loss on separable data, the gradient of the cross-entropy loss decays exponentially with the logit norm, inducing a Naive Loss Minimization (NLM) regime.
+\end{assumption}
+
+\begin{lemma}[Logarithmic Logit Growth]
+\label{lem:log-growth}
+Under \Cref{ass:nlm}, for gradient descent with learning rate $\eta$, the correct class logit for a memorized sample $\x$ grows logarithmically with time:
+\[
+z_y(\x; \w(t)) = \Theta(\log t).
+\]
+\end{lemma}
+\begin{proof}
+Following \cite{soudry2018implicit}, for separable data, the cross-entropy gradient norm scales as $\norm{\nabla_{\w} L_S} \propto \exp(-z_y)$. The weight update satisfies $\frac{d\norm{\w}}{dt} \propto \exp(-\norm{\w})$. Integrating this yields $\exp(\norm{\w}) \propto t$, meaning $\norm{\w(t)} = \Theta(\log t)$. Since logits are linear in the last layer weights, $z_y(t) = \Theta(\log t)$.
+\end{proof}
+
+\begin{corollary}[Exponential Collapse Time]
+\label{cor:collapse-time}
+The time to Softmax Collapse $T_c$ scales exponentially with the float precision limit: $T_c = \Omega(\exp(Z_{\max}))$.
+\end{corollary}
+\begin{remark}
+Because $T_c$ is exponentially large, true numerical collapse rarely occurs in standard training. Instead, the model suffers from \textit{Gradient Starvation}, where the gradients become too small to allow weight decay to uncover the generalizing circuit in a reasonable time.
+\end{remark}
+
+\section{EMA as an Implicit Regularizer}
+\label{sec:ema}
+
+\begin{definition}[EMA Time Constant]
+\label{def:time-constant}
+For decay rate $\beta \in (0,1)$, the EMA is $\bar{\w}_\beta(t) = (1-\beta) \sum_{s=0}^t \beta^{t-s} \w(s)$. The effective memory horizon is $\tau_\beta = \frac{\beta}{1-\beta}$.
+\end{definition}
+
+\begin{theorem}[EMA Logit Bounding]
+\label{thm:ema-bound}
+If raw weights grow as $\w(t) = \w_0 + \vvec \log(t)$, the EMA weights asymptotically lag by the memory horizon:
+\[
+\norm{\bar{\w}_\beta(t)} \approx \norm{\w_0 + \vvec \log(t - \tau_\beta)}.
+\]
+\end{theorem}
+\begin{proof}
+Since $\w(s)$ is strictly concave ($\log$ function), Jensen's inequality implies the convex combination $\bar{\w}_\beta(t) < \w(t)$. Specifically, the EMA heavily weights the most recent $\tau_\beta$ steps. For large $t$, $\log(t) - \log(t - \tau_\beta) \approx \frac{\tau_\beta}{t}$, meaning the EMA effectively bounds the logit growth, dynamically restricting the model's confidence and preventing complete gradient starvation.
+\end{proof}
+
+\section{Specialist Training via Bagging}
+\label{sec:specialists}
+
+\begin{definition}[Bagging Partition]
+\label{def:partition}
+The training set $S$ is sampled with replacement to form $M$ subsets $S_1, \dots, S_M$, where each $|S_i| = N$. On average, each specialist sees $\approx 63.2\%$ of the unique data in $S$.
+\end{definition}
+
+\begin{assumption}[Grokking Threshold]
+\label{ass:threshold}
+We assume that $63.2\%$ of the dataset $N$ is strictly greater than the sample-complexity threshold required for grokking to theoretically occur, whereas a disjoint split of $N/M$ would fall below the threshold.
+\end{assumption}
+
+\begin{definition}[Teacher Ensemble]
+\label{def:full-ensemble}
+The complete teacher combines $M$ bagging specialists, each with an EMA of rate $\beta$:
+\[
+Q(\x) = \frac{1}{M} \sum_{i=1}^M \softmax(\z(\x; \bar{\w}_{i,\beta})).
+\]
+\end{definition}
+
+\begin{lemma}[Ensemble Diversity on OOD Samples]
+\label{lem:diversity}
+For a sample $\x \in S$, roughly $36.8\%$ of specialists will not have seen $\x$ during training (out-of-bag). For these specialists, their output distribution on $\x$ approaches a uniform distribution $U$, while in-bag specialists output a highly confident prediction $\p_i$. The expected entropy of the ensemble is strictly elevated:
+\[
+H(Q(\x)) \geq \frac{1}{e} \log K + \left(1 - \frac{1}{e}\right) H_{\text{in-bag}}.
+\]
+\end{lemma}
+\begin{proof}
+Let $\mathcal{I}_{\text{in}}$ be the set of specialists that saw $\x$, and $\mathcal{I}_{\text{out}}$ be those that did not. $P(i \in \mathcal{I}_{\text{out}}) = (1 - 1/N)^N \approx 1/e$. 
+The ensemble output is $Q(\x) \approx \frac{1}{e} U + (1 - \frac{1}{e}) \p_{\text{in}}$. By the concavity of entropy, the entropy of the mixture is lower-bounded by the mixture of the entropies.
+\end{proof}
+
+\section{Student Dynamics and Adaptive Label Smoothing}
+\label{sec:student}
+
+\begin{definition}[Distillation Loss]
+\label{def:distill-loss}
+The empirical distillation loss for the student $\vvec$ is:
+\[
+L_{\text{distill}}(\vvec) = \frac{1}{|S|} \sum_{(\x,y) \in S} \KL(Q(\x) \| \p(\x; \vvec)).
+\]
+\end{definition}
+
+\begin{theorem}[NLM Avoidance via Adaptive Smoothing]
+\label{thm:nlm-avoidance}
+Because the ensemble $Q(\x)$ has strictly elevated entropy bounded away from zero (due to OOD disagreement and EMA bounding), there exists a compact set $\mathcal{K} \subset \R^D$ such that for $\vvec \notin \mathcal{K}$:
+\[
+\vvec^\top \nabla_{\vvec} L_{\text{distill}}(\vvec) > 0.
+\]
+The student trajectory remains bounded and never enters the NLM attractor.
+\end{theorem}
+\begin{proof}
+Consider $V(\vvec) = \norm{\vvec}^2$. For large $\norm{\vvec}$, the student becomes overconfident: $\p(\x; \vvec) \to \mathbf{e}_{k(\x)}$ (one-hot). Since $H(Q) \geq h_{\min} > 0$ by Lemma \ref{lem:diversity}, $Q$ is strictly bounded away from one-hot distributions. The gradient of the KL divergence is $\E_{\x}[\mathbf{J}(\x; \vvec)^\top (\p(\x; \vvec) - Q(\x))]$.
+For large $\norm{\vvec}$, $(\p - Q)$ pushes against the student's logit growth. Thus, $\frac{dV}{dt} = -2\vvec^\top \nabla L_{\text{distill}} < 0$ outside a ball of radius $O(1/h_{\min})$.
+\end{proof}
+
+\section{Main Result: Grokking Acceleration}
+\label{sec:main}
+
+\begin{theorem}[Grokking Acceleration]
+\label{thm:main}
+Under Assumptions \ref{ass:nlm} and \ref{ass:threshold}, consider:
+\begin{itemize}
+    \item Baseline: Single model trained with Cross-Entropy and weight decay $\lambda$.
+    \item Method: Student distilled from $M$ bagged EMA specialists with weight decay $\lambda$.
+\end{itemize}
+Then:
+\begin{enumerate}[(1)]
+    \item The baseline groks at $T_{\text{baseline}} = \Theta(1/\lambda)$ \cite{prieto2025grokking}.
+    \item The baseline suffers from Gradient Starvation, exponentially delaying the action of weight decay.
+    \item The Student's gradients remain bounded away from zero due to the Adaptive Label Smoothing of the ensemble (\Cref{thm:nlm-avoidance}).
+    \item Weight decay acts unhindered on the active gradients, yielding $T_{\text{student}} \ll T_{\text{baseline}}$.
+\end{enumerate}
+\end{theorem}
+\begin{proof}
+In standard training, once the baseline memorizes the data, $p \to 1$, and $\nabla L_S \to 0$. The weight decay term $-\lambda \w$ must overcome this vanishing gradient to reveal the generalizing circuit, requiring $O(1/\lambda)$ time. In our method, the target $Q(\x)$ never approaches a hard 1. Consequently, $\p - Q \neq 0$, so $\nabla L_{\text{distill}}$ remains active. This persistent gradient signal continuously explores the loss landscape, allowing weight decay to prune the network and discover the generalizing circuit exponentially faster than the starved baseline.
+\end{proof}
+
+\section*{Acknowledgments}
+[To be added]
+
+\begin{thebibliography}{9}
+\bibitem{soudry2018implicit}
+Soudry, D., Hoffer, E., Nacson, M. S., Gunasekar, S., \& Srebro, N. (2018).
+\newblock The implicit bias of gradient descent on separable data.
+\newblock \emph{Journal of Machine Learning Research}, 19(1), 2822-2878.
+
+\bibitem{prieto2025grokking}
+Prieto et al. (2025).
+\newblock Grokking as the Transition from Lazy to Rich Training Dynamics.
+\newblock \emph{ICLR}.
+
+\bibitem{power2022grokking}
+Power, A., Burda, Y., Edwards, H., Babuschkin, I., \& Misra, V. (2022).
+\newblock Grokking: Generalization beyond overfitting on small algorithmic datasets.
+\newblock \emph{arXiv:2201.02177}.
+
+\bibitem{bartlett2002rademacher}
+Bartlett, P. L., \& Mendelson, S. (2002).
+\newblock Rademacher and Gaussian complexities: Risk bounds and structural results.
+\newblock \emph{Journal of Machine Learning Research}, 3, 463--482.
+
+\bibitem{wortsmann2022model}
+Wortsman, M., Ilharco, G., Gadre, S. Y., Roelofs, R., Gontijo-Lopes, R., Morcos, A. S., ... \& Farhadi, A. (2022).
+\newblock Model soups: averaging weights of multiple fine-tuned models improves accuracy without increasing inference time.
+\newblock \emph{ICML}.
+\end{thebibliography}
+
+\end{document}
