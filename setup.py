@@ -13,6 +13,7 @@ setup(
         "scipy",
         "mod",
         "matplotlib",
+        "pandas",
         "sympy",
     ],
 )

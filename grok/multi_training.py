@@ -16,9 +16,12 @@ Usage (from repo root):
 """
 
 import copy
+import csv
+import json
 import os
+import subprocess
 from argparse import ArgumentParser, Namespace
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -36,6 +39,143 @@ _LIGHTNING_2 = (
 from grok.data import ArithmeticDataset, ArithmeticIterator
 from grok.training import DEFAULT_LOG_DIR, TrainableTransformer, add_args
 from grok.transformer import Transformer
+
+
+# ---------------------------------------------------------------------------
+# Persistence (additive: new files under each phase's artifacts/ and experiment artifacts/)
+# ---------------------------------------------------------------------------
+
+
+def _json_safe(obj: Any) -> Any:
+    """Convert Namespace and common types to JSON-serializable structures."""
+    if isinstance(obj, Namespace):
+        return {k: _json_safe(v) for k, v in vars(obj).items()}
+    if isinstance(obj, dict):
+        return {str(k): _json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_json_safe(x) for x in obj]
+    if isinstance(obj, (str, int, float, bool)) or obj is None:
+        return obj
+    if isinstance(obj, torch.Tensor):
+        return f"<tensor shape={tuple(obj.shape)} dtype={obj.dtype}>"
+    return str(obj)
+
+
+def _write_json(path: str, data: Any) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        json.dump(data, f, indent=2)
+
+
+def _experiment_artifacts_dir(experiment_dir: str) -> str:
+    p = os.path.join(experiment_dir, "artifacts")
+    os.makedirs(p, exist_ok=True)
+    return p
+
+
+def save_run_config(experiment_dir: str, hparams: Namespace) -> str:
+    path = os.path.join(_experiment_artifacts_dir(experiment_dir), "run_config.json")
+    _write_json(path, _json_safe(hparams))
+    return path
+
+
+def save_environment_metadata(experiment_dir: str) -> str:
+    path = os.path.join(_experiment_artifacts_dir(experiment_dir), "environment.json")
+    meta: Dict[str, Any] = {
+        "torch_version": torch.__version__,
+        "pytorch_lightning_version": pl.__version__,
+        "cuda_available": torch.cuda.is_available(),
+        "mps_available": bool(
+            hasattr(torch.backends, "mps") and torch.backends.mps.is_available()
+        ),
+    }
+    try:
+        r = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=os.getcwd(),
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        meta["git_commit"] = r.stdout.strip() if r.returncode == 0 else None
+    except (OSError, subprocess.TimeoutExpired):
+        meta["git_commit"] = None
+    _write_json(path, meta)
+    return path
+
+
+def find_lightning_metrics_csv(logdir: str) -> Optional[str]:
+    import glob
+
+    pattern = os.path.join(logdir, "lightning_logs", "version_*", "metrics.csv")
+    matches = sorted(glob.glob(pattern))
+    return matches[0] if matches else None
+
+
+def csv_numeric_column_max(
+    csv_path: str,
+    column_candidates: Tuple[str, ...],
+) -> Tuple[Optional[float], Optional[float], Optional[str]]:
+    """Best effort: max of first matching column (e.g. val_accuracy)."""
+    if not csv_path or not os.path.isfile(csv_path):
+        return None, None, None
+    with open(csv_path, newline="") as f:
+        reader = csv.DictReader(f)
+        if not reader.fieldnames:
+            return None, None, None
+        col = None
+        lower_map = {h.strip().lower(): h for h in reader.fieldnames if h}
+        for c in column_candidates:
+            if c in reader.fieldnames:
+                col = c
+                break
+            if c.lower() in lower_map:
+                col = lower_map[c.lower()]
+                break
+        if not col:
+            return None, None, None
+        best: Optional[float] = None
+        best_step: Optional[float] = None
+        for row in reader:
+            raw = row.get(col)
+            if raw in (None, ""):
+                continue
+            try:
+                val = float(raw)
+            except ValueError:
+                continue
+            if best is None or val > best:
+                best = val
+                for sk in ("step", "Step", "global_step"):
+                    if sk in row and row.get(sk) not in (None, ""):
+                        try:
+                            best_step = float(row[sk])
+                        except ValueError:
+                            best_step = None
+                        break
+        return best, best_step, col
+
+
+def trainer_callback_metrics_float(trainer: Trainer) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    for k, v in trainer.callback_metrics.items():
+        key = str(k)
+        try:
+            out[key] = float(v.item()) if hasattr(v, "item") else float(v)
+        except (TypeError, ValueError):
+            out[key] = str(v)
+    return out
+
+
+def save_transformer_checkpoint(model: TrainableTransformer, path: str) -> str:
+    """Save transformer weights + hparams snapshot (does not replace init.pt or Lightning ckpts)."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    payload = {
+        "transformer_state_dict": model.transformer.state_dict(),
+        "hparams": _json_safe(model.hparams) if hasattr(model, "hparams") else {},
+    }
+    torch.save(payload, path)
+    return path
 
 
 # ---------------------------------------------------------------------------
@@ -367,6 +507,8 @@ def distill_from_specialists(
             total += len(row_acc)
     final_val_acc = correct / total * 100 if total > 0 else 0
     print(f"  Final distillation val_acc: {final_val_acc:.2f}%")
+    metrics["final_val_acc"] = float(final_val_acc)
+    metrics["best_val_acc"] = float(max(metrics["val_acc"])) if metrics["val_acc"] else float(final_val_acc)
     
     # Save distillation metrics as CSV for plotting
     import csv as csv_mod
@@ -479,6 +621,13 @@ def train_multi(hparams: Namespace) -> str:
 
     seed = hparams.random_seed if hparams.random_seed != -1 else 42
 
+    cfg_path = save_run_config(experiment_dir, hparams)
+    env_path = save_environment_metadata(experiment_dir)
+    print(f"  Saved run config: {cfg_path}")
+    print(f"  Saved environment metadata: {env_path}")
+    train_multi_lightning_csv: Dict[str, Optional[str]] = {}
+    train_multi_specialist_ckpts: List[str] = []
+
     # -----------------------------------------------------------------------
     # Phase 0: Build the full dataset once so all models share the same split
     # -----------------------------------------------------------------------
@@ -557,6 +706,16 @@ def train_multi(hparams: Namespace) -> str:
             f"train_acc={final_train_acc:.4f}  val_acc={final_val_acc:.4f}"
         )
 
+        sp_path = save_transformer_checkpoint(
+            model,
+            os.path.join(spec_hparams.logdir, "artifacts", "specialist_final.pt"),
+        )
+        train_multi_specialist_ckpts.append(os.path.abspath(sp_path))
+        train_multi_lightning_csv[f"specialist_{i}"] = find_lightning_metrics_csv(
+            spec_hparams.logdir
+        )
+        print(f"  Saved specialist checkpoint: {sp_path}")
+
         specialist_state_dicts.append(copy.deepcopy(model.transformer.state_dict()))
 
     # -----------------------------------------------------------------------
@@ -607,9 +766,23 @@ def train_multi(hparams: Namespace) -> str:
     )
     print(f"  Merged model final val_acc={final_val_acc:.4f}")
 
+    merged_m_path = save_transformer_checkpoint(
+        merged_model,
+        os.path.join(merged_hparams.logdir, "artifacts", "merged_final.pt"),
+    )
+    train_multi_lightning_csv["merged"] = find_lightning_metrics_csv(merged_hparams.logdir)
+    merged_m_csv = train_multi_lightning_csv["merged"] or ""
+    mm_max, mm_step, mm_col = csv_numeric_column_max(
+        merged_m_csv, ("val_accuracy", "val_accuracy_epoch")
+    )
+    print(f"  Saved merged checkpoint: {merged_m_path}")
+
     # -----------------------------------------------------------------------
     # Phase 4 (optional): Baseline — random-init model on full data
     # -----------------------------------------------------------------------
+    baseline_m_path: Optional[str] = None
+    bm_max = bm_step = None
+    bm_col = None
     if hparams.run_baseline:
         print(f"\n{'='*60}")
         print("Phase 4 — Baseline: random-init model on full training data")
@@ -642,6 +815,51 @@ def train_multi(hparams: Namespace) -> str:
         )
         print(f"  Baseline model final val_acc={final_val_acc:.4f}")
 
+        baseline_m_path = save_transformer_checkpoint(
+            baseline_model,
+            os.path.join(baseline_hparams.logdir, "artifacts", "baseline_final.pt"),
+        )
+        train_multi_lightning_csv["baseline"] = find_lightning_metrics_csv(
+            baseline_hparams.logdir
+        )
+        bcsv = train_multi_lightning_csv["baseline"] or ""
+        bm_max, bm_step, bm_col = csv_numeric_column_max(
+            bcsv, ("val_accuracy", "val_accuracy_epoch")
+        )
+        print(f"  Saved baseline checkpoint: {baseline_m_path}")
+
+    summary_path = os.path.join(_experiment_artifacts_dir(experiment_dir), "train_multi_summary.json")
+    _write_json(
+        summary_path,
+        {
+            "experiment_dir": os.path.abspath(experiment_dir),
+            "run_config_path": os.path.abspath(cfg_path),
+            "environment_path": os.path.abspath(env_path),
+            "persisted_checkpoints": {
+                "specialists": train_multi_specialist_ckpts,
+                "merged": os.path.abspath(merged_m_path),
+                "baseline": os.path.abspath(baseline_m_path) if baseline_m_path else None,
+            },
+            "lightning_metrics_csv_paths": {
+                k: os.path.abspath(v) if v else None
+                for k, v in train_multi_lightning_csv.items()
+            },
+            "best_val_from_lightning_csv": {
+                "merged": {
+                    "max_val_accuracy": mm_max,
+                    "step": mm_step,
+                    "column": mm_col,
+                },
+                "baseline": {
+                    "max_val_accuracy": bm_max,
+                    "step": bm_step,
+                    "column": bm_col,
+                },
+            },
+        },
+    )
+    print(f"  Train-multi summary: {summary_path}")
+
     print(f"\n{'='*60}")
     print(f"Experiment complete. Logs in: {experiment_dir}")
     print(f"{'='*60}")
@@ -655,15 +873,22 @@ def train_multi_with_distillation(hparams: Namespace) -> str:
     
     This allows direct comparison of the two merging approaches.
     """
-    import json
     import numpy as np
-    
+
     n_models: int = hparams.n_models
     final_steps: int = hparams.final_steps
     overfit_threshold: float = hparams.overfit_threshold
     experiment_dir: str = os.path.join(hparams.logdir, hparams.experiment_name)
 
     seed = hparams.random_seed if hparams.random_seed != -1 else 42
+
+    cfg_path = save_run_config(experiment_dir, hparams)
+    env_path = save_environment_metadata(experiment_dir)
+    print(f"  Saved run config: {cfg_path}")
+    print(f"  Saved environment metadata: {env_path}")
+
+    lightning_metrics_csv_paths: Dict[str, Optional[str]] = {}
+    specialist_checkpoint_paths: List[str] = []
 
     print(f"\n{'='*60}")
     print(f"Multi-model grokking with DISTILLATION: {n_models} specialists")
@@ -685,7 +910,7 @@ def train_multi_with_distillation(hparams: Namespace) -> str:
     # -----------------------------------------------------------------------
     # Phase 1: Train specialist models
     # -----------------------------------------------------------------------
-    shards = ArithmeticDataset.split_n_ways(full_train_ds, n_models, seed=seed)
+    shards = ArithmeticDataset.bag_n_ways(full_train_ds, n_models, seed=seed)
     
     specialist_models: List[TrainableTransformer] = []
     
@@ -734,6 +959,16 @@ def train_multi_with_distillation(hparams: Namespace) -> str:
         trainer.fit(model)
         print(f"  Finished specialist {i} training")
 
+        sp_ckpt = save_transformer_checkpoint(
+            model,
+            os.path.join(spec_hparams.logdir, "artifacts", "specialist_final.pt"),
+        )
+        specialist_checkpoint_paths.append(os.path.abspath(sp_ckpt))
+        lightning_metrics_csv_paths[f"specialist_{i}"] = find_lightning_metrics_csv(
+            spec_hparams.logdir
+        )
+        print(f"  Saved specialist checkpoint: {sp_ckpt}")
+
         specialist_models.append(model)
         print(f"  Specialist {i} done")
 
@@ -772,6 +1007,20 @@ def train_multi_with_distillation(hparams: Namespace) -> str:
         min_steps=final_steps,
     )
     trainer.fit(merged_model)
+
+    merged_ckpt = save_transformer_checkpoint(
+        merged_model,
+        os.path.join(merged_hparams.logdir, "artifacts", "merged_final.pt"),
+    )
+    lightning_metrics_csv_paths["merged_average"] = find_lightning_metrics_csv(
+        merged_hparams.logdir
+    )
+    merged_callback_metrics = trainer_callback_metrics_float(trainer)
+    merged_csv = lightning_metrics_csv_paths["merged_average"] or ""
+    mv_max, mv_step, mv_col = csv_numeric_column_max(
+        merged_csv, ("val_accuracy", "val_accuracy_epoch")
+    )
+    print(f"  Saved merged checkpoint: {merged_ckpt}")
     
     # -----------------------------------------------------------------------
     # Phase 4: Distillation
@@ -805,12 +1054,31 @@ def train_multi_with_distillation(hparams: Namespace) -> str:
         device=device,
     )
 
+    student_ckpt = save_transformer_checkpoint(
+        distilled_model,
+        os.path.join(distill_hparams.logdir, "artifacts", "student_final.pt"),
+    )
+    lightning_metrics_csv_paths["distilled"] = os.path.join(
+        distill_hparams.logdir, "distill_metrics.csv"
+    )
+    lightning_metrics_csv_paths["distilled_val"] = os.path.join(
+        distill_hparams.logdir, "distill_val_metrics.csv"
+    )
+    print(f"  Saved distilled student checkpoint: {student_ckpt}")
+
+    baseline_ckpt: Optional[str] = None
+    baseline_callback_metrics: Optional[Dict[str, Any]] = None
+    bv_max: Optional[float] = None
+    bv_step: Optional[float] = None
+    bv_col: Optional[str] = None
+    baseline_csv_path: Optional[str] = None
+
     # -----------------------------------------------------------------------
-    # Phase 4 (optional): Baseline — random-init model on full data
+    # Phase 5 (optional): Baseline — random-init model on full data
     # -----------------------------------------------------------------------
     if hparams.run_baseline:
         print(f"\n{'='*60}")
-        print(f"Phase 4 — Baseline: random-init model on full training data")
+        print(f"Phase 5 — Baseline: random-init model on full training data")
         print(f"{'='*60}")
 
         baseline_hparams = copy.deepcopy(hparams)
@@ -830,8 +1098,20 @@ def train_multi_with_distillation(hparams: Namespace) -> str:
         )
         trainer.fit(baseline_model)
 
+        baseline_ckpt = save_transformer_checkpoint(
+            baseline_model,
+            os.path.join(baseline_hparams.logdir, "artifacts", "baseline_final.pt"),
+        )
+        baseline_csv_path = find_lightning_metrics_csv(baseline_hparams.logdir)
+        lightning_metrics_csv_paths["baseline"] = baseline_csv_path
+        baseline_callback_metrics = trainer_callback_metrics_float(trainer)
+        bv_max, bv_step, bv_col = csv_numeric_column_max(
+            baseline_csv_path or "", ("val_accuracy", "val_accuracy_epoch")
+        )
+        print(f"  Saved baseline checkpoint: {baseline_ckpt}")
+
     # -----------------------------------------------------------------------
-    # Save comparison results
+    # Save comparison results (extends legacy fields; does not remove them)
     # -----------------------------------------------------------------------
     results_path = os.path.join(experiment_dir, "comparison_results.json")
     results = {
@@ -846,14 +1126,62 @@ def train_multi_with_distillation(hparams: Namespace) -> str:
             "final_student_acc": float(np.mean(distill_metrics["student_acc"][-100:])),
         },
         "experiment_dir": experiment_dir,
+        "run_config_path": os.path.abspath(cfg_path),
+        "environment_path": os.path.abspath(env_path),
+        "persisted_checkpoints": {
+            "specialists": specialist_checkpoint_paths,
+            "merged_average": os.path.abspath(merged_ckpt),
+            "distilled_student": os.path.abspath(student_ckpt),
+            "baseline": os.path.abspath(baseline_ckpt) if baseline_ckpt else None,
+        },
+        "lightning_metrics_csv_paths": {
+            k: os.path.abspath(v) if v else None
+            for k, v in lightning_metrics_csv_paths.items()
+        },
+        "trainer_callback_metrics": {
+            "merged_average": merged_callback_metrics,
+            "baseline": baseline_callback_metrics,
+        },
+        "best_val_from_lightning_csv": {
+            "merged_average": {
+                "max_val_accuracy": mv_max,
+                "step": mv_step,
+                "column": mv_col,
+            },
+            "baseline": {
+                "max_val_accuracy": bv_max,
+                "step": bv_step,
+                "column": bv_col,
+            },
+        },
+        "distillation_extended": {
+            "final_val_accuracy": distill_metrics.get("final_val_acc"),
+            "best_val_accuracy": distill_metrics.get("best_val_acc"),
+            "distill_metrics_csv": os.path.abspath(
+                os.path.join(distill_hparams.logdir, "distill_metrics.csv")
+            ),
+            "distill_val_metrics_csv": os.path.abspath(
+                os.path.join(distill_hparams.logdir, "distill_val_metrics.csv")
+            ),
+        },
     }
     
     with open(results_path, "w") as f:
         json.dump(results, f, indent=2)
+
+    paths_index = os.path.join(_experiment_artifacts_dir(experiment_dir), "paths_index.json")
+    _write_json(paths_index, {
+        "comparison_results_json": os.path.abspath(results_path),
+        "run_config_json": os.path.abspath(cfg_path),
+        "environment_json": os.path.abspath(env_path),
+        "checkpoints": results["persisted_checkpoints"],
+        "metrics_csv": results["lightning_metrics_csv_paths"],
+    })
     
     print(f"\n{'='*60}")
     print(f"Experiment complete!")
     print(f"Results saved to: {results_path}")
+    print(f"Path index: {paths_index}")
     print(f"{'='*60}")
 
     return experiment_dir
