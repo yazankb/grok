@@ -17,6 +17,7 @@ Usage (from repo root):
 
 import copy
 import csv
+import importlib.util
 import json
 import os
 import subprocess
@@ -178,6 +179,45 @@ def save_transformer_checkpoint(model: TrainableTransformer, path: str) -> str:
     return path
 
 
+def generate_experiment_plots_after_run(
+    experiment_dir: str,
+    experiment_name: str,
+) -> Optional[List[str]]:
+    """
+    Write comparison_plot.png, comparison_plot_speedup.png, specialists_curves.png
+    under experiment_dir using scripts/compare_methods.py (same as CLI).
+    """
+    root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    cm_path = os.path.join(root, "scripts", "compare_methods.py")
+    if not os.path.isfile(cm_path):
+        print(f"Warning: {cm_path} not found; skipping post-run plots.")
+        return None
+    spec = importlib.util.spec_from_file_location("compare_methods_dynamic", cm_path)
+    if spec is None or spec.loader is None:
+        print("Warning: could not load compare_methods; skipping plots.")
+        return None
+    mod = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(mod)
+    except Exception as e:
+        print(f"Warning: compare_methods import failed: {e}")
+        return None
+    title = f"{experiment_name}: Weight Averaging vs Distillation"
+    try:
+        out = mod.generate_experiment_plots(os.path.abspath(experiment_dir), title=title)
+        mod.print_metrics_summary(
+            out["merged_metrics"],
+            out["distill_metrics"],
+            out["baseline_metrics"],
+        )
+        paths = out["plot_paths"]
+        print(f"Saved experiment plots: {paths}")
+        return paths
+    except Exception as e:
+        print(f"Warning: plot generation failed: {e}")
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Early stopping callback
 # ---------------------------------------------------------------------------
@@ -239,6 +279,29 @@ class EMAWeightCallback(Callback):
 # Weight averaging
 # ---------------------------------------------------------------------------
 
+def build_specialist_shards(
+    full_train_ds,
+    n_models: int,
+    sharding: str,
+    seed: int = 42,
+) -> List:
+    """
+    Dispatch between bagging and disjoint partitioning based on `sharding`.
+
+    - "bag": sampling with replacement. Each specialist bag has len(full_train_ds)
+      samples; ~63% are unique. Bags overlap heavily. Expected OOB fraction per
+      sample is 1/e ~= 0.37 across specialists.
+    - "disjoint": random permutation split into n_models near-equal chunks.
+      Each specialist sees only 1/n_models of the train set, but the union
+      covers every sample. Maximum teacher diversity in the undertrained regime.
+    """
+    if sharding == "bag":
+        return ArithmeticDataset.bag_n_ways(full_train_ds, n_models, seed=seed)
+    if sharding == "disjoint":
+        return ArithmeticDataset.split_n_ways(full_train_ds, n_models, seed=seed)
+    raise ValueError(f"Unknown sharding strategy: {sharding!r}. Use 'bag' or 'disjoint'.")
+
+
 def average_state_dicts(state_dicts: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
     """
     Element-wise arithmetic mean of a list of state dicts.
@@ -283,35 +346,43 @@ class DistillationTrainer:
         self.device = device
         
     @torch.no_grad()
+    def get_teacher_probs(self, batch: Dict) -> torch.Tensor:
+        """
+        Averaged TEACHER PROBABILITIES per the paper's Q(x) definition:
+            Q(x) = (1/M) sum_i softmax(z_i(x) / T).
+        Averaging probabilities (not logits) preserves adaptive label smoothing
+        from per-specialist disagreement.
+        """
+        T = self.temperature
+        probs = None
+        for teacher in self.teachers:
+            logits, _, _ = teacher(batch["text"].to(self.device))
+            p = F.softmax(logits.to(self.device) / T, dim=-1)
+            probs = p if probs is None else probs + p
+        return probs / len(self.teachers)
+
+    @torch.no_grad()
     def get_teacher_logits(self, batch: Dict) -> torch.Tensor:
-        """Get averaged logits from all teachers."""
+        """Legacy: average logits across teachers (used only for logging teacher acc)."""
         all_logits = []
         for teacher in self.teachers:
             logits, _, _ = teacher(batch["text"].to(self.device))
             all_logits.append(logits.to(self.device))
         return torch.stack(all_logits).mean(dim=0)
-    
+
     def distillation_loss(
-        self, 
-        student_logits: torch.Tensor, 
-        teacher_logits: torch.Tensor
+        self,
+        student_logits: torch.Tensor,
+        teacher_probs: torch.Tensor,
     ) -> torch.Tensor:
         """
-        Compute distillation loss using KL divergence with temperature scaling.
+        KL(Q || p_student) with temperature scaling, where Q is the averaged
+        teacher probability distribution already at temperature T.
         """
         T = self.temperature
-        
-        # Move teacher logits to same device as student
-        teacher_logits = teacher_logits.to(student_logits.device)
-        
-        # Get answer positions (right-hand side tokens)
+        teacher_probs = teacher_probs.to(student_logits.device)
         student_soft = F.log_softmax(student_logits / T, dim=-1)
-        teacher_soft = F.softmax(teacher_logits / T, dim=-1)
-        
-        # KL divergence averaged over tokens
-        kl_div = F.kl_div(student_soft, teacher_soft, reduction='batchmean')
-        
-        # Scale by T^2 as per Hinton et al.
+        kl_div = F.kl_div(student_soft, teacher_probs, reduction="batchmean")
         return kl_div * (T * T)
     
     def hard_loss(
@@ -347,18 +418,19 @@ class DistillationTrainer:
         targets = batch["target"].to(self.device)
         
         student_logits, _, _ = self.student(text)
-        teacher_logits = self.get_teacher_logits({"text": text})
-        
-        # Combined loss (on all tokens, same as Lightning _step)
-        soft_loss = self.distillation_loss(student_logits, teacher_logits)
+        teacher_probs = self.get_teacher_probs({"text": text})
+
+        soft_loss = self.distillation_loss(student_logits, teacher_probs)
         hard_loss = self.hard_loss(student_logits, targets)
         loss = self.alpha * soft_loss + (1 - self.alpha) * hard_loss
-        
-        # RHS-only accuracy (matches Lightning _accuracy)
+
         eq_token_id = self.student.train_dataset.tokenizer.stoi["="]
         with torch.no_grad():
             student_acc = self._rhs_accuracy(student_logits, targets, eq_token_id)
-            teacher_acc = self._rhs_accuracy(teacher_logits.to(student_logits.device), targets, eq_token_id)
+            teacher_logits_for_acc = self.get_teacher_logits({"text": text})
+            teacher_acc = self._rhs_accuracy(
+                teacher_logits_for_acc.to(student_logits.device), targets, eq_token_id
+            )
         
         metrics = {
             "loss": loss.item(),
@@ -410,15 +482,13 @@ def distill_from_specialists(
         batchsize_hint=256,
     )
     
-    optimizer = torch.optim.AdamW(
-        student_model.parameters(),
-        lr=1e-3,
-        weight_decay=1.0,
-    )
-    
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=distill_steps, eta_min=1e-5
-    )
+    optimizers, schedulers = student_model.configure_optimizers()
+    optimizer = optimizers[0]
+    if isinstance(schedulers, list) and len(schedulers) > 0:
+        scheduler_dict = schedulers[0]
+        scheduler = scheduler_dict["scheduler"]
+    else:
+        scheduler = None
     
     metrics = {
         "loss": [], "soft_loss": [], "hard_loss": [],
@@ -441,7 +511,8 @@ def distill_from_specialists(
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(student_model.parameters(), 1.0)
                 optimizer.step()
-                scheduler.step()
+                if scheduler is not None:
+                    scheduler.step()
                 
                 metrics["loss"].append(m["loss"])
                 metrics["soft_loss"].append(m["soft_loss"])
@@ -648,9 +719,11 @@ def train_multi(hparams: Namespace) -> str:
     )
 
     # -----------------------------------------------------------------------
-    # Phase 1: Train specialist models on bagged data shards
+    # Phase 1: Train specialist models on data shards
     # -----------------------------------------------------------------------
-    shards = ArithmeticDataset.bag_n_ways(full_train_ds, n_models, seed=seed)
+    sharding = getattr(hparams, "sharding", "bag")
+    shards = build_specialist_shards(full_train_ds, n_models, sharding, seed=seed)
+    print(f"Sharding strategy: {sharding}")
     for i, shard in enumerate(shards):
         print(f"  Shard {i}: {len(shard)} equations")
 
@@ -828,6 +901,14 @@ def train_multi(hparams: Namespace) -> str:
         )
         print(f"  Saved baseline checkpoint: {baseline_m_path}")
 
+    plot_paths_tm: Optional[List[str]] = None
+    if not getattr(hparams, "no_plots", False):
+        plot_paths_tm = generate_experiment_plots_after_run(
+            experiment_dir, hparams.experiment_name
+        )
+    else:
+        print("Skipping post-run plots (--no_plots).")
+
     summary_path = os.path.join(_experiment_artifacts_dir(experiment_dir), "train_multi_summary.json")
     _write_json(
         summary_path,
@@ -856,6 +937,7 @@ def train_multi(hparams: Namespace) -> str:
                     "column": bm_col,
                 },
             },
+            "comparison_plots": plot_paths_tm or [],
         },
     )
     print(f"  Train-multi summary: {summary_path}")
@@ -910,8 +992,12 @@ def train_multi_with_distillation(hparams: Namespace) -> str:
     # -----------------------------------------------------------------------
     # Phase 1: Train specialist models
     # -----------------------------------------------------------------------
-    shards = ArithmeticDataset.bag_n_ways(full_train_ds, n_models, seed=seed)
-    
+    sharding = getattr(hparams, "sharding", "bag")
+    shards = build_specialist_shards(full_train_ds, n_models, sharding, seed=seed)
+    print(f"Sharding strategy: {sharding}")
+    for i, shard in enumerate(shards):
+        print(f"  Shard {i}: {len(shard)} equations")
+
     specialist_models: List[TrainableTransformer] = []
     
     for i, shard in enumerate(shards):
@@ -1165,7 +1251,16 @@ def train_multi_with_distillation(hparams: Namespace) -> str:
             ),
         },
     }
-    
+
+    plot_paths: Optional[List[str]] = None
+    if not getattr(hparams, "no_plots", False):
+        plot_paths = generate_experiment_plots_after_run(
+            experiment_dir, hparams.experiment_name
+        )
+    else:
+        print("Skipping post-run plots (--no_plots).")
+    results["comparison_plot_paths"] = plot_paths
+
     with open(results_path, "w") as f:
         json.dump(results, f, indent=2)
 
@@ -1176,6 +1271,7 @@ def train_multi_with_distillation(hparams: Namespace) -> str:
         "environment_json": os.path.abspath(env_path),
         "checkpoints": results["persisted_checkpoints"],
         "metrics_csv": results["lightning_metrics_csv_paths"],
+        "comparison_plots": plot_paths or [],
     })
     
     print(f"\n{'='*60}")
@@ -1300,6 +1396,24 @@ def add_multi_args(parser: Optional[ArgumentParser] = None) -> ArgumentParser:
         type=float,
         default=0.99,
         help="Decay rate for Exponential Moving Average (EMA) of specialist weights. Set to 0 to disable.",
+    )
+    parser.add_argument(
+        "--sharding",
+        type=str,
+        default="bag",
+        choices=["bag", "disjoint"],
+        help=(
+            "How to partition the training data across specialists. "
+            "'bag' = sample with replacement (each specialist sees ~63%% unique of "
+            "the full train set); 'disjoint' = non-overlapping partition (each "
+            "specialist sees 1/n_models of the train set, union covers everything)."
+        ),
+    )
+    parser.add_argument(
+        "--no_plots",
+        action="store_true",
+        default=False,
+        help="Skip generating comparison PNGs (compare_methods) after the experiment.",
     )
 
     return parser
