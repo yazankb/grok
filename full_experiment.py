@@ -178,6 +178,9 @@ def _build_trainer(hparams: Namespace, log_dir: str, max_steps: int, min_steps: 
     if torch.cuda.is_available() and hparams.gpu >= 0:
         trainer_args["accelerator"] = "gpu"
         trainer_args["devices"] = [hparams.gpu]
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        trainer_args["accelerator"] = "mps"
+        trainer_args["devices"] = 1
     else:
         trainer_args["accelerator"] = "cpu"
     return Trainer(**trainer_args)
@@ -189,7 +192,7 @@ def run_full_experiment(hparams: Namespace) -> str:
     final_steps = hparams.final_steps
     experiment_dir = os.path.join(hparams.logdir, hparams.experiment_name)
     seed = hparams.random_seed if hparams.random_seed != -1 else 42
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = "cuda" if torch.cuda.is_available() else "mps" if hasattr(torch.backends, "mps") and torch.backends.mps.is_available() else "cpu"
 
     print(f"\n{'='*60}")
     print(f"Full experiment: {n_models} specialists | {hparams.math_operator} | {hparams.train_data_pct}% data")

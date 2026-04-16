@@ -395,14 +395,6 @@ class ArithmeticDataset:
     ) -> List["ArithmeticDataset"]:
         """
         Partition an existing dataset into n disjoint shards without re-encoding.
-
-        The encoded tensor is already available on `dataset.data`, so we bypass
-        __init__ with __new__ and share the tokenizer reference.
-
-        :param dataset: source dataset to split
-        :param n: number of disjoint shards
-        :param seed: RNG seed for the shuffled partition
-        :returns: list of n ArithmeticDataset shards, each with train=True
         """
         gen = torch.Generator()
         gen.manual_seed(seed)
@@ -416,6 +408,32 @@ class ArithmeticDataset:
             shard.train = True
             shard.data = dataset.data[chunk]
             result.append(shard)
+        return result
+
+    @classmethod
+    def bag_n_ways(
+        cls,
+        dataset: "ArithmeticDataset",
+        n: int,
+        seed: int = 42,
+    ) -> List["ArithmeticDataset"]:
+        """
+        Create n bagging datasets by sampling with replacement.
+        Each bagging dataset has the same size as the original dataset.
+        """
+        gen = torch.Generator()
+        gen.manual_seed(seed)
+        dataset_size = len(dataset.data)
+        result = []
+        for _ in range(n):
+            # Sample with replacement
+            indices = torch.randint(0, dataset_size, (dataset_size,), generator=gen)
+            bag = cls.__new__(cls)
+            bag.tokenizer = dataset.tokenizer
+            bag.name = dataset.name
+            bag.train = True
+            bag.data = dataset.data[indices]
+            result.append(bag)
         return result
 
     @classmethod

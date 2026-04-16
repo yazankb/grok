@@ -605,9 +605,9 @@ class TrainableTransformer(LightningModule):
                 # n parameters
                 n_params = param.numel()
                 # get the l2 norm of the parameter
-                logs["paramnorm_" + name] = torch.norm(
+                logs["paramnorm_" + name] = float(torch.norm(
                     param, 2
-                ).detach().cpu().numpy() / np.sqrt(n_params)
+                ).detach().cpu().numpy() / np.sqrt(n_params))
 
             # train accuracy
             device = self.transformer.embedding.weight.device
@@ -758,15 +758,19 @@ def train(hparams: Namespace) -> None:
         else:
             trainer_args["gpus"] = [hparams.gpu]
         print(f"Using GPU (cuda:{hparams.gpu})")
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        trainer_args["accelerator"] = "mps"
+        trainer_args["devices"] = 1
+        print("Using MPS (Metal Performance Shaders)")
     else:
         if _LIGHTNING_2:
             trainer_args["accelerator"] = "cpu"
         else:
             trainer_args["gpus"] = None
-        if not torch.cuda.is_available():
-            print("Using CPU (CUDA not available). Install PyTorch with CUDA to use GPU.")
+        if not torch.cuda.is_available() and not (hasattr(torch.backends, "mps") and torch.backends.mps.is_available()):
+            print("Using CPU (CUDA/MPS not available).")
         else:
-            print("Using CPU (--gpu < 0). Pass --gpu 0 to use GPU.")
+            print("Using CPU (--gpu < 0).")
 
     trainer = Trainer(**trainer_args)
 
@@ -848,6 +852,9 @@ def compute_sharpness(hparams: Namespace, ckpts) -> None:
             trainer_args["devices"] = [hparams.gpu]
         else:
             trainer_args["gpus"] = [hparams.gpu]
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        trainer_args["accelerator"] = "mps"
+        trainer_args["devices"] = 1
     else:
         if _LIGHTNING_2:
             trainer_args["accelerator"] = "cpu"

@@ -67,6 +67,33 @@ class EarlyStopOnOverfit(Callback):
         if acc is not None and float(acc) >= self.threshold:
             trainer.should_stop = True
 
+class EMAWeightCallback(Callback):
+    """
+    Maintains an Exponential Moving Average (EMA) of the model's weights during training.
+    Replaces the model's weights with the EMA weights at the end of training.
+    """
+    def __init__(self, decay: float = 0.99):
+        super().__init__()
+        self.decay = decay
+        self.ema_state_dict = None
+
+    def on_train_batch_end(self, trainer: Trainer, pl_module, outputs, batch, batch_idx):
+        with torch.no_grad():
+            if self.ema_state_dict is None:
+                self.ema_state_dict = {
+                    k: v.clone().detach()
+                    for k, v in pl_module.transformer.state_dict().items()
+                }
+            else:
+                for k, v in pl_module.transformer.state_dict().items():
+                    if k in self.ema_state_dict:
+                        self.ema_state_dict[k].mul_(self.decay).add_(v.detach(), alpha=1 - self.decay)
+
+    def on_train_end(self, trainer: Trainer, pl_module):
+        if self.ema_state_dict is not None:
+            print(f"Applying EMA weights (decay={self.decay}) to model...")
+            pl_module.transformer.load_state_dict(self.ema_state_dict)
+
 
 # ---------------------------------------------------------------------------
 # Weight averaging
@@ -404,6 +431,9 @@ def _build_trainer(
             trainer_args["devices"] = [hparams.gpu]
         else:
             trainer_args["gpus"] = [hparams.gpu]
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        trainer_args["accelerator"] = "mps"
+        trainer_args["devices"] = 1
     else:
         if _LIGHTNING_2:
             trainer_args["accelerator"] = "cpu"
@@ -469,9 +499,9 @@ def train_multi(hparams: Namespace) -> str:
     )
 
     # -----------------------------------------------------------------------
-    # Phase 1: Train specialist models on disjoint data shards
+    # Phase 1: Train specialist models on bagged data shards
     # -----------------------------------------------------------------------
-    shards = ArithmeticDataset.split_n_ways(full_train_ds, n_models, seed=seed)
+    shards = ArithmeticDataset.bag_n_ways(full_train_ds, n_models, seed=seed)
     for i, shard in enumerate(shards):
         print(f"  Shard {i}: {len(shard)} equations")
 
@@ -502,6 +532,10 @@ def train_multi(hparams: Namespace) -> str:
         callbacks = []
         if getattr(hparams, "overfit_stop", False):
             callbacks.append(EarlyStopOnOverfit(threshold=overfit_threshold))
+        
+        ema_decay = getattr(hparams, "ema_decay", 0.0)
+        if ema_decay > 0:
+            callbacks.append(EMAWeightCallback(decay=ema_decay))
 
         trainer = _build_trainer(
             hparams,
@@ -674,12 +708,16 @@ def train_multi_with_distillation(hparams: Namespace) -> str:
             val_dataset=val_ds,
         ).float()
         
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+        device = "cuda" if torch.cuda.is_available() else "mps" if hasattr(torch.backends, "mps") and torch.backends.mps.is_available() else "cpu"
         model = model.to(device)
 
         callbacks = []
         if getattr(hparams, "overfit_stop", False):
             callbacks.append(EarlyStopOnOverfit(threshold=overfit_threshold))
+        
+        ema_decay = getattr(hparams, "ema_decay", 0.0)
+        if ema_decay > 0:
+            callbacks.append(EMAWeightCallback(decay=ema_decay))
 
         specialist_steps = getattr(hparams, "specialist_steps", 50000)
         if getattr(hparams, "equal_compute", False):
@@ -928,6 +966,12 @@ def add_multi_args(parser: Optional[ArgumentParser] = None) -> ArgumentParser:
         action="store_true",
         default=False,
         help="Run distillation experiment in addition to weight averaging",
+    )
+    parser.add_argument(
+        "--ema_decay",
+        type=float,
+        default=0.99,
+        help="Decay rate for Exponential Moving Average (EMA) of specialist weights. Set to 0 to disable.",
     )
 
     return parser
