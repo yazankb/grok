@@ -338,22 +338,52 @@ class DistillationTrainer:
         temperature: float = 2.0,
         alpha: float = 0.5,
         device: str = "cuda",
+        teacher_aggregation: str = "probs",
     ):
         self.teachers = [t.eval() for t in teacher_models]
         self.student = student_model.train()
         self.temperature = temperature
         self.alpha = alpha
         self.device = device
-        
+        if teacher_aggregation not in ("probs", "logits"):
+            raise ValueError(
+                f"Unknown teacher_aggregation: {teacher_aggregation!r}. "
+                "Use 'probs' or 'logits'."
+            )
+        self.teacher_aggregation = teacher_aggregation
+
     @torch.no_grad()
     def get_teacher_probs(self, batch: Dict) -> torch.Tensor:
         """
-        Averaged TEACHER PROBABILITIES per the paper's Q(x) definition:
-            Q(x) = (1/M) sum_i softmax(z_i(x) / T).
-        Averaging probabilities (not logits) preserves adaptive label smoothing
-        from per-specialist disagreement.
+        Averaged teacher target distribution Q(x), at temperature T.
+
+        Two aggregation modes are supported:
+
+        - "probs" (current default, paper-aligned):
+              Q(x) = (1/M) sum_i softmax(z_i(x) / T)
+          Averaging probabilities preserves adaptive label smoothing from
+          per-specialist disagreement when teachers genuinely express
+          posterior uncertainty.
+
+        - "logits" (milestone-era behaviour, pre-commit 9ce29b8):
+              Q(x) = softmax( (1/M) sum_i z_i(x) / T )
+          Averaging logits before the softmax is sharpened by agreement and
+          flattened by disagreement (logsumexp is convex). For memorising
+          teachers whose confident predictions are mostly wrong outside their
+          shard, this dampens confident-wrong targets that "probs" would pass
+          through at full mass. This was the behaviour that produced the
+          milestone Exp 3 distillation win.
         """
         T = self.temperature
+        if self.teacher_aggregation == "logits":
+            mean_logits = None
+            for teacher in self.teachers:
+                logits, _, _ = teacher(batch["text"].to(self.device))
+                logits = logits.to(self.device)
+                mean_logits = logits if mean_logits is None else mean_logits + logits
+            mean_logits = mean_logits / len(self.teachers)
+            return F.softmax(mean_logits / T, dim=-1)
+
         probs = None
         for teacher in self.teachers:
             logits, _, _ = teacher(batch["text"].to(self.device))
@@ -452,22 +482,27 @@ def distill_from_specialists(
     temperature: float = 2.0,
     alpha: float = 0.5,
     device: str = "cuda",
+    teacher_aggregation: str = "probs",
 ) -> Tuple[TrainableTransformer, Dict]:
     """
     Distill knowledge from specialist models into a student model.
-    
+
     Returns the trained student and training metrics.
     """
     print(f"\n{'='*60}")
-    print(f"Distillation: T={temperature}, alpha={alpha}")
+    print(
+        f"Distillation: T={temperature}, alpha={alpha}, "
+        f"teacher_aggregation={teacher_aggregation}"
+    )
     print(f"{'='*60}")
-    
+
     distill_trainer = DistillationTrainer(
         teacher_models=specialist_models,
         student_model=student_model,
         temperature=temperature,
         alpha=alpha,
         device=device,
+        teacher_aggregation=teacher_aggregation,
     )
     
     # Create iterators
@@ -1127,6 +1162,7 @@ def train_multi_with_distillation(hparams: Namespace) -> str:
     distill_steps = getattr(hparams, "distill_steps", final_steps // 2)
     temperature = getattr(hparams, "distill_temperature", 2.0)
     alpha = getattr(hparams, "distill_alpha", 0.5)
+    teacher_aggregation = getattr(hparams, "teacher_aggregation", "probs")
 
     distilled_model, distill_metrics = distill_from_specialists(
         specialist_models=specialist_models,
@@ -1138,6 +1174,7 @@ def train_multi_with_distillation(hparams: Namespace) -> str:
         temperature=temperature,
         alpha=alpha,
         device=device,
+        teacher_aggregation=teacher_aggregation,
     )
 
     student_ckpt = save_transformer_checkpoint(
@@ -1207,6 +1244,7 @@ def train_multi_with_distillation(hparams: Namespace) -> str:
         "distill_steps": distill_steps,
         "temperature": temperature,
         "alpha": alpha,
+        "teacher_aggregation": teacher_aggregation,
         "distill_final_metrics": {
             "final_loss": float(np.mean(distill_metrics["loss"][-100:])),
             "final_student_acc": float(np.mean(distill_metrics["student_acc"][-100:])),
@@ -1407,6 +1445,20 @@ def add_multi_args(parser: Optional[ArgumentParser] = None) -> ArgumentParser:
             "'bag' = sample with replacement (each specialist sees ~63%% unique of "
             "the full train set); 'disjoint' = non-overlapping partition (each "
             "specialist sees 1/n_models of the train set, union covers everything)."
+        ),
+    )
+    parser.add_argument(
+        "--teacher_aggregation",
+        type=str,
+        default="probs",
+        choices=["probs", "logits"],
+        help=(
+            "How to combine specialist outputs into the distillation target Q(x). "
+            "'probs' (default, paper-aligned): Q = (1/M) Σ softmax(z_i/T). "
+            "'logits' (milestone-era): Q = softmax((1/M) Σ z_i / T). "
+            "Logit averaging is sharpened by teacher agreement and flattened by "
+            "disagreement, which dampens confident-wrong targets from memorising "
+            "specialists."
         ),
     )
     parser.add_argument(

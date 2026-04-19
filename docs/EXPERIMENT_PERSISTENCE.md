@@ -86,11 +86,25 @@ Original keys are preserved: `n_models`, `specialist_steps`, `final_steps`, `dis
 |-----|---------|
 | `run_config_path` | Absolute path to `artifacts/run_config.json` |
 | `environment_path` | Absolute path to `artifacts/environment.json` |
+| `teacher_aggregation` | `"probs"` (default) for `Q = (1/M) Σ softmax(z_i/T)` or `"logits"` for `Q = softmax((1/M) Σ z_i/T)`. Selected via `--teacher_aggregation`. The `"logits"` mode reproduces the milestone-era distillation target shape (pre-commit `9ce29b8`). See `reports/distillation_repro_attempt3.md` for context on why this matters. |
 | `persisted_checkpoints` | Absolute paths: `specialists[]`, `merged_average`, `distilled_student`, `baseline` (or `null` if skipped) |
 | `lightning_metrics_csv_paths` | Paths to Lightning `metrics.csv` per phase + distill CSVs (`distilled`, `distilled_val`) |
 | `trainer_callback_metrics` | Snapshot of `trainer.callback_metrics` after **merged** and **baseline** (baseline `null` if `--no_baseline`) |
 | `best_val_from_lightning_csv` | Best-effort max `val_accuracy` (+ step/column) from merged/baseline Lightning CSVs |
 | `distillation_extended` | `final_val_accuracy`, `best_val_accuracy`, paths to distill CSVs |
+
+> **Caveat — distillation student optimizer is not yet recorded.** The
+> distillation student currently builds its optimizer via
+> `student_model.configure_optimizers()`, which inherits `weight_decay`,
+> `max_lr`, `weight_decay_kind`, `anneal_lr*` and friends from the run
+> hparams (and therefore from `run_config.json`). Older code at commit
+> `09befb8` instead hardcoded `AdamW(lr=1e-3, wd=1.0) +
+> CosineAnnealingLR(eta_min=1e-5)` for the student only, ignoring those
+> hparams. Until a `--distill_optimizer {hparams,milestone}` flag is
+> wired in (see `reports/distillation_repro_attempt3.md` §4–§5), the
+> per-phase optimizer recipe is implicit and cross-version comparisons of
+> distilled-student curves require knowing which commit the run came
+> from.
 
 ### `{experiment}/artifacts/paths_index.json`
 

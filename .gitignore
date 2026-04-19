@@ -156,3 +156,5 @@ reports/grokking_curves_5k.png
 run_paper_baseline.py
 run_paper_exact.py
 scripts/plot_100steps.py
+
+reports/distillation*.md
