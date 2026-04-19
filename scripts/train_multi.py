@@ -29,11 +29,16 @@ also accepted and forwarded to each model.
 import os
 
 from grok.multi_training import add_multi_args, train_multi, train_multi_with_distillation
+from grok.consistency_training import (
+    add_consistency_args,
+    train_multi_with_consistency,
+)
 
 # Use cwd as project root to avoid Unicode path issues on Windows
 _project_root = os.getcwd()
 
 parser = add_multi_args()
+parser = add_consistency_args(parser)
 parser.set_defaults(
     logdir=os.environ.get("GROK_LOGDIR", os.path.join(_project_root, "logs")),
     datadir=os.path.join(_project_root, "data"),
@@ -54,8 +59,10 @@ hparams.logdir = (
 
 print(hparams)
 
-# Use distillation if requested
-if getattr(hparams, "use_distillation", False):
+# Dispatch: consistency takes precedence over distillation if both are set.
+if getattr(hparams, "use_consistency", False):
+    print(train_multi_with_consistency(hparams))
+elif getattr(hparams, "use_distillation", False):
     print(train_multi_with_distillation(hparams))
 else:
     print(train_multi(hparams))
