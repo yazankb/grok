@@ -27,6 +27,7 @@ Anything that biases search toward structured / smooth / low-complexity solution
 Two reasons:
 
 1. **Multi-view constraint.** With $M$ specialists trained on different shards, asking them to agree on out-of-shard inputs is asking for a function consistent with multiple labeled subsets *simultaneously*. With limited capacity, the only way to satisfy "fits my shard + agrees with the others on inputs I haven't seen" without per-sample slack is to implement a structured rule that fits the union of shards.
+
 2. **OOB pseudo-supervision.** When models agree on an unlabeled input, that agreed-upon output behaves like a soft pseudo-label for any specialist that didn't have that input in its shard. This is the same mechanism as Mean Teacher, Π-Model, FixMatch, and co-training, transplanted to grokking.
 
 ### 3.3 Why "unlabeled equations are not really information" is *almost* right
@@ -47,18 +48,18 @@ This proposal is, technically, **consistency regularization in the Mean-Teacher 
 
 ## 4. Concrete formulation
 
-Let $f_i*{i=1}^{M}$ be $M$ specialist transformers with the same architecture but independent initializations. Let $D_i \subset \mathcal{X}*{\text{full}}$ be specialist $i$'s shard with labels $y$. Let $\mathcal{X}*{\text{unsup}} \subseteq \mathcal{X}*{\text{full}}$ be the consistency domain (see §6 for transductivity discussion).
+Let $\{f_i\}_{i=1}^{M}$ be $M$ specialist transformers with the same architecture but independent initializations. Let $D_i \subset \mathcal{X}_{\text{full}}$ be specialist $i$'s shard with labels $y$. Let $\mathcal{X}_{\text{unsup}} \subseteq \mathcal{X}_{\text{full}}$ be the consistency domain (see §6 for transductivity discussion).
 
 Per-step loss for specialist $i$:
 
 $$
-\mathcal{L}*i(t) = \mathcal{L}*{\text{CE}}\big(f_i; D_i\big) + \lambda(t) \cdot \mathcal{L}*{\text{cons}}(f_i; f_j*{j \neq i}; \mathcal{X}_{\text{unsup}})
+\mathcal{L}_i(t) = \mathcal{L}_{\text{CE}}\big(f_i; D_i\big) \;+\; \lambda(t) \cdot \mathcal{L}_{\text{cons}}(f_i; \{f_j\}_{j \neq i}; \mathcal{X}_{\text{unsup}})
 $$
 
-Two candidate consistency losses, both differentiable w.r.t. $f_i$ only (the $f_j_{j\neq i}$ are detached when computing specialist $i$'s update — this is the Mean-Teacher convention and prevents the trivial all-models-collapse-together fixed point from being reached via mutual gradients):
+Two candidate consistency losses, both differentiable w.r.t. $f_i$ only (the $\{f_j\}_{j\neq i}$ are detached when computing specialist $i$'s update — this is the Mean-Teacher convention and prevents the trivial all-models-collapse-together fixed point from being reached via mutual gradients):
 
-- **MSE on logits**: $\mathcal{L}*{\text{cons}} = \mathbb{E}*{x \in \mathcal{X}*{\text{unsup}}}\big f_i(x) - \tfrac{1}{M-1}\sum*{j\neq i} \mathrm{sg}[f_j(x)] \big_2^2$
-- **Symmetric KL on softmax**: $\mathcal{L}*{\text{cons}} = \mathbb{E}*{x} \mathrm{KL}\big(\sigma(f_i(x)) \big \tfrac{1}{M-1}\sum_{j\neq i}\sigma(\mathrm{sg}[f_j(x)])\big)$
+- **MSE on logits**: $\mathcal{L}_{\text{cons}} = \mathbb{E}_{x \in \mathcal{X}_{\text{unsup}}}\big\| f_i(x) - \tfrac{1}{M-1}\sum_{j\neq i} \mathrm{sg}[f_j(x)] \big\|_2^2$
+- **Symmetric KL on softmax**: $\mathcal{L}_{\text{cons}} = \mathbb{E}_{x}\, \mathrm{KL}\big(\sigma(f_i(x)) \,\big\|\, \tfrac{1}{M-1}\sum_{j\neq i}\sigma(\mathrm{sg}[f_j(x)])\big)$
 
 Default: MSE on logits (more stable early in training when softmax distributions are nearly uniform).
 
@@ -73,9 +74,12 @@ The warmup variant exists because §5 (failure mode 2) predicts that without war
 
 These are the modes the metrics in §7 are designed to detect.
 
-1. **Trivial-agreement collapse.** Models satisfy consistency by outputting near-uniform distributions on $\mathcal{X}*{\text{unsup}}$ (uniform agrees with uniform). Detect via output entropy on the unsup set: if it stays near $\log p$ throughout training, this is happening. Mitigation: either lower $\lambda*{\max}$ or use MSE on logits (which doesn't have a constant-output trivial minimum the way KL does).
+1. **Trivial-agreement collapse.** Models satisfy consistency by outputting near-uniform distributions on $\mathcal{X}_{\text{unsup}}$ (uniform agrees with uniform). Detect via output entropy on the unsup set: if it stays near $\log p$ throughout training, this is happening. Mitigation: either lower $\lambda_{\max}$ or use MSE on logits (which doesn't have a constant-output trivial minimum the way KL does).
+
 2. **Memorize-then-can't-escape.** Specialists fit their shards in ~1k steps, then consistency tries to drag four crystallized memorizers toward each other. Because both memorization basins have near-zero CE gradients, the specialist that "wins" the consensus is essentially random. Detect by looking at $\lambda=0$ vs $\lambda > 0$ *with no warmup*: if no improvement, consistency arrived too late. Mitigation: warmup schedule.
+
 3. **Compromise non-solution.** Each specialist memorizes its shard *and* partially agrees with others on the OOB set, hitting a flat region of the loss with no gradient toward true generalization. Detect by inter-model KL on val staying nontrivially positive while ensemble val acc stays at baseline. This is the most likely null-result mode and the one Deep Mutual Learning typically lands in on standard supervised tasks.
+
 4. **Confound with weight decay.** If consistency works *only* because it adds an effective regularization equivalent to higher weight decay, then a simple "single model + higher weight decay" baseline should match it. We must include this baseline to claim consistency contributes anything beyond what weight decay already gives.
 
 ## 6. Transductivity and data hygiene
@@ -84,7 +88,7 @@ For modular addition with $p=97$, "all 9409 input pairs" is the entire input dis
 
 Two configurations of $\mathcal{X}_{\text{unsup}}$ to consider, to defang any "you peeked at val" objection:
 
-- **Transductive (default)**: $\mathcal{X}*{\text{unsup}} = \mathcal{X}*{\text{full}}$, the entire grid. Largest consistency surface.
+- **Transductive (default)**: $\mathcal{X}_{\text{unsup}} = \mathcal{X}_{\text{full}}$, the entire grid. Largest consistency surface.
 - **Held-out-aware**: $\mathcal{X}_{\text{unsup}} = $ train inputs only (i.e., consistency only on inputs that have a label for *some* specialist, even if not for $f_i$). No val inputs are touched at training time. Smaller consistency surface, cleaner story.
 
 We will run both and report both. If they give the same qualitative result, we use the held-out-aware version in the headline because it's the more conservative claim.
@@ -106,7 +110,7 @@ We will run both and report both. If they give the same qualitative result, we u
 Primary sweep:
 
 - Consistency loss: `mse_logits` (default), `kl_softmax` (sanity).
-- $\lambda_{\max} \in 0, 0.1, 1.0, 10.0$.
+- $\lambda_{\max} \in \{0,\; 0.1,\; 1.0,\; 10.0\}$.
 - Schedule: `constant`, `warmup_1000`.
 - $\mathcal{X}_{\text{unsup}}$: `full_grid`, `train_inputs_only`.
 
@@ -118,28 +122,26 @@ These exist to rule out the failure modes in §5 and to make any positive result
 
 1. **Single model on 50% train.** Same hparams. This is the current grokking ceiling.
 2. **Single model on 25% train.** Same hparams. Each specialist's labeled budget; gives a "no-collaboration" floor.
-3. **Single model on 50% train, $\text{wd} \in 0.1, 0.3, 1.0$.** Rules out failure mode 4 (consistency = effective wd).
+3. **Single model on 50% train, $\text{wd} \in \{0.1,\; 0.3,\; 1.0\}$.** Rules out failure mode 4 (consistency = effective wd).
 4. **$M$ specialists on disjoint shards, no consistency ($\lambda = 0$).** Pure ensemble baseline.
 5. **$M$ specialists, no consistency, then prob-averaged ensemble at eval.** Ensembling-without-training-time-coupling baseline.
 
 ### 7.4 Metrics, logged every $K$ steps per specialist
 
-
-| Metric                                         | What it diagnoses                                    |
-| ---------------------------------------------- | ---------------------------------------------------- |
-| per-shard train acc & loss                     | basic fit; collapse failure mode 1 if these stay low |
-| val acc per specialist                         | individual generalization                            |
-| ensemble val acc (prob-averaged across $M$)    | the headline number                                  |
-| weight-merged-model val acc                    | to compare to milestone "merged" phase               |
-| output entropy on $\mathcal{X}_{\text{unsup}}$ | failure mode 1 (uniform-collapse)                    |
-| pairwise KL between specialists on val         | are they actually agreeing?                          |
-| effective weight norm per specialist           | for the wd-confound comparison                       |
-
+| Metric | What it diagnoses |
+|---|---|
+| per-shard train acc & loss | basic fit; collapse failure mode 1 if these stay low |
+| val acc per specialist | individual generalization |
+| ensemble val acc (prob-averaged across $M$) | the headline number |
+| weight-merged-model val acc | to compare to milestone "merged" phase |
+| output entropy on $\mathcal{X}_{\text{unsup}}$ | failure mode 1 (uniform-collapse) |
+| pairwise KL between specialists on val | are they actually agreeing? |
+| effective weight norm per specialist | for the wd-confound comparison |
 
 ### 7.5 Decision rules, written *before* running
 
 - **Positive headline result**: ensemble val acc with consistency $> $ single-model-on-50% by a meaningful margin (≥ 5pp, ideally 10pp+) at matched compute, *and* not matched by single-model-with-higher-wd.
-- **Methodological positive result**: warmup-$\lambda$ + disjoint sharding works at $\lambda_{\max} \in 1, 10$ but constant-$\lambda$ doesn't — confirms the §5 mode-2 hypothesis and gives a clean methodological story even if the absolute numbers don't beat single-model-on-full-data.
+- **Methodological positive result**: warmup-$\lambda$ + disjoint sharding works at $\lambda_{\max} \in \{1, 10\}$ but constant-$\lambda$ doesn't — confirms the §5 mode-2 hypothesis and gives a clean methodological story even if the absolute numbers don't beat single-model-on-full-data.
 - **Null result**: ensemble val acc $\approx$ single-model-on-50%, or matched by higher-wd single model. Writeable as "consistency on unlabeled inputs is subsumed by weight decay on this task."
 - **Collapse result**: $\lambda$ too high causes uniform-output collapse before grokking. Writeable as a warning about consistency-regularization tuning on grokking benchmarks.
 
@@ -147,16 +149,37 @@ Any of the four outcomes is publishable as a small empirical contribution — no
 
 ## 8. Compute budget and timeline
 
-Each multi-specialist run is roughly the same cost as the milestone Exp 3 (~~25k steps, ~30–45 min on the M-class machine used for prior runs). The primary sweep is $2 \times 4 \times 2 \times 2 = 32$ runs; we can prune to ~16 by dropping `kl_softmax` from the headline sweep and only running it as a single sanity check at the best $\lambda$. Baselines are 4–6 additional runs. Total: **~~20–25 runs, ~12–15 hours of compute** if run sequentially, much less if any parallelism is available.
+Each multi-specialist run is roughly the same cost as the milestone Exp 3 (~25k steps, ~30–45 min on the M-class machine used for prior runs). The primary sweep is $2 \times 4 \times 2 \times 2 = 32$ runs; we can prune to ~16 by dropping `kl_softmax` from the headline sweep and only running it as a single sanity check at the best $\lambda$. Baselines are 4–6 additional runs. Total: **~20–25 runs, ~12–15 hours of compute** if run sequentially, much less if any parallelism is available.
 
-We should run a 4-cell pilot first (best guess: `mse_logits`, $\lambda_{\max} \in 0, 1$, schedule $\in$ constant, warmup_1000, full grid, disjoint shards) before committing the full sweep. This is ~2–3 hours and tells us whether to scale up or rethink.
+We should run a 4-cell pilot first (best guess: `mse_logits`, $\lambda_{\max} \in \{0, 1\}$, schedule $\in$ \{constant, warmup_1000\}, full grid, disjoint shards) before committing the full sweep. This is ~2–3 hours and tells us whether to scale up or rethink.
+
+### 8.1 Pilot v1 post-mortem and pilot v2 revision
+
+The first 4-cell pilot (`pilot_v1`, see `scripts/run_consistency_sweep.py` before the v2 revision) finished cleanly but produced a **null result with diagnostic signal**: every cell, including `lam0_baseline`, plateaued at ~1% val acc for 25k steps. The diagnostics showed pairwise val KL and output entropy collapsing in lockstep with strong consistency, which is consistent with the "trivial-agreement collapse" mode in §5.2.
+
+Two mechanistic bugs drove that collapse:
+
+1. **Loss-scale mismatch.** `mse_logits` on random-init logits is O(σ²) ≈ 0.5 (mean over logit dims), while CE at init is log(V) ≈ 5.5 — so at $\lambda=1$, the consistency term is ~10% of CE at init but becomes dominant *as soon as CE drops*, which happens before any useful structure forms. Worse, MSE on logits has no inherent scale invariance: if we rescale all logits by $c$, MSE scales as $c^2$ but CE and argmax are invariant, so MSE is "shouting" a constraint that the task doesn't actually require. KL-on-softmax sidesteps this: KL is in nats and is comparable to per-example CE throughout training.
+2. **Warmup too short.** 1000 steps of warmup on a 25k-step budget is 4%. On modular-arithmetic grokking with these hparams, memorization of a single specialist's shard typically takes ≥5k steps (Power et al., Nanda et al., and our own milestone runs). So by the time $\lambda(t) \to \lambda_{\max}$, specialists have barely begun to memorize — consistency locks them into the uniform-output basin.
+
+Additionally, the v1 pilot was missing the **single-model-on-50%** baseline, without which we cannot separate "consistency hurt" from "this hparam regime doesn't grok in 25k steps anyway". We added it in v2 as the first pilot cell.
+
+**Pilot v2** (`DEFAULT_PILOT_CELLS` in `scripts/run_consistency_sweep.py` at this revision) addresses all three issues. 5 cells:
+
+- `single_model_50pct` — M=1, no consistency. Baseline grokking calibration.
+- `multi_lam0` — M=4, no consistency. Multi-specialist baseline.
+- `multi_kl_lam01_warm5k` — M=4, KL-softmax, $\lambda_{\max}=0.1$, 5k-step warmup. Headline weak-consistency candidate.
+- `multi_kl_lam1_warm5k` — M=4, KL-softmax, $\lambda_{\max}=1.0$, 5k-step warmup. Bounds the strong-consistency regime.
+- `multi_kl_lam01_warm5k_trainonly` — same as #3 but $\mathcal{X}_{\text{unsup}} = \mathcal{X}_{\text{train}}$, controls for transductive leak.
+
+Decision rules for v2 results are the same as the original §7.5 table, but now interpretable against the single-model baseline rather than in a vacuum.
 
 ## 9. Implementation plan
 
 The code changes needed live in `grok/multi_training.py` and `scripts/train_multi.py`. Sketch:
 
 1. Add a `ConsistencyTrainer` class (or extend the existing multi-specialist training loop) that owns all $M$ specialists and runs them in lockstep so we can sample shared consistency batches.
-2. Per training step, in addition to each specialist's per-shard CE batch, draw a batch from $\mathcal{X}*{\text{unsup}}$, forward all $M$ specialists on it, compute pairwise consistency losses with `detach()` on the "teacher" side as in Mean Teacher, and add $\lambda(t) \cdot \mathcal{L}*{\text{cons}}$ to each specialist's loss before backprop.
+2. Per training step, in addition to each specialist's per-shard CE batch, draw a batch from $\mathcal{X}_{\text{unsup}}$, forward all $M$ specialists on it, compute pairwise consistency losses with `detach()` on the "teacher" side as in Mean Teacher, and add $\lambda(t) \cdot \mathcal{L}_{\text{cons}}$ to each specialist's loss before backprop.
 3. CLI flags to add to `add_multi_args`: `--consistency_loss {none,mse_logits,kl_softmax}`, `--consistency_lambda` (float), `--consistency_warmup_steps` (int, 0 = no warmup), `--consistency_domain {full_grid,train_inputs_only}`.
 4. Persist these flags into `comparison_results.json` (extend the schema documented in `docs/EXPERIMENT_PERSISTENCE.md`).
 5. Add the metrics in §7.4 to whatever logging callback is used by the multi-trainer; the entropy and pairwise-KL metrics in particular are new and will need to be added explicitly.

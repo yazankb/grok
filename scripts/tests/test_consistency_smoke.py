@@ -203,6 +203,91 @@ def main() -> None:
         assert "val_acc_merged" in eval_rows[0]
         print("[smoke] eval CSV column schema ok.")
 
+        # ---- Run C: KL-softmax consistency (v2 default loss) ----------------
+        print("\n[smoke] running config C: consistency_loss=kl_softmax, lam=0.5")
+        h_kl = _build_hparams(
+            tmp_root,
+            "smoke_consistency_kl",
+            consistency_loss="kl_softmax",
+            consistency_lambda=0.5,
+            consistency_warmup_steps=20,
+            consistency_steps=40,
+            eval_every=20,
+        )
+        exp_dir_kl = train_multi_with_consistency(h_kl)
+        results_kl = _assert_results_json(
+            os.path.join(exp_dir_kl, "consistency_results.json")
+        )
+        # KL losses are in [0, log(vocab)] so cons_spec_* values must be finite
+        with open(os.path.join(exp_dir_kl, "consistency_metrics.csv"), "r") as f:
+            rows = list(csv.DictReader(f))
+        import math as _math
+        for r in rows:
+            for i in range(h_kl.n_models):
+                v = float(r[f"cons_spec_{i}"])
+                assert _math.isfinite(v) and v >= 0.0, f"bad KL cons: {v}"
+        print(
+            f"[smoke] C ok: best_ens={results_kl['best_val_acc_ensemble']:.2f}% "
+            f"elapsed={results_kl['elapsed_sec']:.1f}s"
+        )
+
+        # ---- Run D: single-model baseline (M=1, consistency_loss=none) ------
+        print("\n[smoke] running config D: single-model baseline (M=1)")
+        h_single = _build_hparams(
+            tmp_root,
+            "smoke_single_model",
+            n_models=1,
+            consistency_loss="none",
+            consistency_lambda=0.0,
+            consistency_warmup_steps=0,
+            consistency_steps=40,
+            eval_every=20,
+        )
+        exp_dir_single = train_multi_with_consistency(h_single)
+        results_single = _assert_results_json(
+            os.path.join(exp_dir_single, "consistency_results.json")
+        )
+        _assert_checkpoints(exp_dir_single, n_models=1)
+        # With M=1 there are no specialists to compare, so pairwise_kl must be 0
+        with open(os.path.join(exp_dir_single, "consistency_eval.csv"), "r") as f:
+            eval_rows = list(csv.DictReader(f))
+        for r in eval_rows:
+            assert float(r["pairwise_kl_val_mean"]) == 0.0, (
+                f"pairwise_kl should be 0 for M=1, got {r['pairwise_kl_val_mean']}"
+            )
+        # Metrics CSV must contain the single-specialist columns and no _1 cols
+        with open(os.path.join(exp_dir_single, "consistency_metrics.csv"), "r") as f:
+            train_rows = list(csv.DictReader(f))
+        assert "ce_spec_0" in train_rows[0]
+        assert "cons_spec_0" in train_rows[0]
+        assert "ce_spec_1" not in train_rows[0]
+        print(
+            f"[smoke] D ok: val_acc_spec_0="
+            f"{results_single['final_eval']['val_acc_spec_0']:.2f}%"
+        )
+
+        # ---- Run E: guard that M=1 with consistency_loss != 'none' errors ---
+        print("\n[smoke] running config E: M=1 + non-'none' loss should error")
+        from grok.consistency_training import ConsistencyTrainer
+        try:
+            h_bad = _build_hparams(
+                tmp_root,
+                "smoke_single_with_consistency",
+                n_models=1,
+                consistency_loss="kl_softmax",
+                consistency_lambda=1.0,
+                consistency_steps=4,
+                eval_every=2,
+            )
+            train_multi_with_consistency(h_bad)
+        except ValueError as e:
+            assert "M=1" in str(e) or "at least 2" in str(e) or "M >= 2" in str(e)
+            print(f"[smoke] E ok: got expected ValueError ({e})")
+        else:
+            raise AssertionError(
+                "expected ValueError for M=1 with kl_softmax consistency_loss"
+            )
+
         print("\n[smoke] ALL CHECKS PASSED")
     finally:
         # Keep the dir on failure for inspection; only delete on full success

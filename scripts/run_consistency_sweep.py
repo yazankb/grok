@@ -5,16 +5,36 @@ Runs a configurable list of cells (each cell = one full training run) and
 writes a top-level ``sweep_summary.json`` indexing all per-run results. Each
 cell creates its own subdirectory under ``--logdir/<sweep_name>/<cell_name>``.
 
-Defaults match the pilot sweep in
-``reports/consistency_regularized_grokking_plan.md`` §8: 4 cells covering
-{lambda in {0, 1.0}} x {warmup in {0, 1000}} on disjoint shards with the
-full-grid consistency domain. This is the "before committing the full sweep,
-run this and look at it" set.
+Default pilot is v2 (see ``reports/consistency_regularized_grokking_plan.md``
+§8 revision): 5 cells covering
 
-Example (Kaggle, T4 GPU):
+    1. ``single_model_50pct``     - single model trained on the 50%-shard (M=1)
+                                   baseline; calibrates what grokking looks
+                                   like without multi-specialist dynamics.
+    2. ``multi_lam0``              - multi-specialist, consistency off.
+                                   Calibrates ensemble/merged acc baseline.
+    3. ``multi_kl_lam01_warm5k``   - KL-softmax, lam=0.1, 5k-step warmup.
+                                   Headline consistency cell.
+    4. ``multi_kl_lam1_warm5k``    - KL-softmax, lam=1.0, 5k-step warmup.
+                                   Probes whether stronger consistency helps
+                                   or triggers agreement collapse.
+    5. ``multi_kl_lam01_warm5k_trainonly``
+                                   - same as #3 but consistency is enforced
+                                   on ``train_inputs_only`` rather than the
+                                   full grid. Controls for transductive leak.
+
+v2 fixes two bugs identified in the v1 pilot (see the updated plan):
+- MSE-on-logits was not scale-matched to CE; we switch to KL-on-softmax which
+  has comparable magnitudes across training.
+- 1k-step warmup was too short on a 25k-step budget; models collapsed to flat
+  outputs before they had a chance to memorise. We use 5k-step warmup.
+- The missing single-model-on-50% baseline is added so we can interpret the
+  multi-specialist cells quantitatively.
+
+Example (Kaggle, T4 GPU)::
 
     python scripts/run_consistency_sweep.py \
-        --sweep_name pilot_v1 \
+        --sweep_name pilot_v2 \
         --logdir /kaggle/working/consistency_runs \
         --consistency_steps 25000 \
         --gpu 0
@@ -22,12 +42,16 @@ Example (Kaggle, T4 GPU):
 Custom cells via JSON file::
 
     python scripts/run_consistency_sweep.py \
-        --cells_json scripts/sweep_cells_lambda_ablation.json \
+        --cells_json scripts/sweep_cells_custom.json \
         --logdir /kaggle/working/consistency_runs
 
 Each cell in the JSON list is a dict whose keys override the corresponding
-hparam fields (for example ``{"name": "lam_10_warm_500", "consistency_lambda": 10.0,
-"consistency_warmup_steps": 500}``).
+hparam fields. A cell with ``"kind": "single_model"`` runs a single model on
+the current ``--train_data_pct`` slice; any other ``"kind"`` (or missing key)
+runs the multi-specialist consistency trainer. Example::
+
+    {"name": "lam_10_warm_500", "consistency_loss": "kl_softmax",
+     "consistency_lambda": 10.0, "consistency_warmup_steps": 500}
 """
 
 from __future__ import annotations
@@ -46,7 +70,7 @@ from typing import Any, Dict, List, Optional
 def _make_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__)
     # Sweep metadata
-    p.add_argument("--sweep_name", type=str, default="pilot_v1",
+    p.add_argument("--sweep_name", type=str, default="pilot_v2",
                    help="Top-level subdirectory name for this sweep.")
     p.add_argument("--cells_json", type=str, default=None,
                    help="Optional path to a JSON list of cell-overrides "
@@ -89,43 +113,64 @@ def _make_parser() -> argparse.ArgumentParser:
     return p
 
 
-# Pilot sweep: 4 runs that, together, distinguish all four §5 failure modes
-# from a real positive result. Cheap enough to run end-to-end in a few hours.
+# Pilot sweep v2: 5 runs. Cells 1 and 2 calibrate baselines; cells 3-5
+# perturb lambda, strength-of-consistency, and consistency domain on an
+# otherwise identical setup. KL-softmax (not MSE-on-logits) and 5k warmup
+# (not 1k) come from the v1-pilot post-mortem in the plan §8 revision.
 DEFAULT_PILOT_CELLS: List[Dict[str, Any]] = [
     {
-        "name": "lam0_baseline",
-        "description": "No consistency. Multi-specialist baseline.",
+        "name": "single_model_50pct",
+        "description": "Single model on the 50% train slice. Baseline that "
+                       "calibrates what grokking looks like without any "
+                       "multi-specialist or consistency dynamics.",
+        "kind": "single_model",
+        # The remaining consistency fields are ignored for kind=single_model
+        # (consistency_loss is forced to 'none' and n_models to 1), but we
+        # set them explicitly so the run config is unambiguous.
         "consistency_loss": "none",
         "consistency_lambda": 0.0,
         "consistency_warmup_steps": 0,
         "consistency_domain": "full_grid",
     },
     {
-        "name": "lam1_constant",
-        "description": "Constant lambda=1.0, no warmup. Tests whether early "
-                       "consistency is overwhelmed by hard CE (failure mode 2).",
-        "consistency_loss": "mse_logits",
-        "consistency_lambda": 1.0,
+        "name": "multi_lam0",
+        "description": "Multi-specialist (M=4, disjoint shards), no "
+                       "consistency. Calibrates ensemble/merged val acc with "
+                       "only CE on shards.",
+        "consistency_loss": "none",
+        "consistency_lambda": 0.0,
         "consistency_warmup_steps": 0,
         "consistency_domain": "full_grid",
     },
     {
-        "name": "lam1_warmup1k",
-        "description": "lambda=1.0 with 1000-step warmup. Headline cell.",
-        "consistency_loss": "mse_logits",
-        "consistency_lambda": 1.0,
-        "consistency_warmup_steps": 1000,
+        "name": "multi_kl_lam01_warm5k",
+        "description": "KL-softmax consistency, lam=0.1, 5k-step warmup on "
+                       "25k total. Headline candidate: weak consistency "
+                       "after memorisation has a chance to start.",
+        "consistency_loss": "kl_softmax",
+        "consistency_lambda": 0.1,
+        "consistency_warmup_steps": 5000,
         "consistency_domain": "full_grid",
     },
     {
-        "name": "lam10_warmup1k",
-        "description": "lambda=10.0 with 1000-step warmup. Probes whether a "
-                       "stronger consistency pressure prevents memorization "
-                       "and forces structured solutions earlier.",
-        "consistency_loss": "mse_logits",
-        "consistency_lambda": 10.0,
-        "consistency_warmup_steps": 1000,
+        "name": "multi_kl_lam1_warm5k",
+        "description": "KL-softmax consistency, lam=1.0, 5k-step warmup. "
+                       "Bounds the strong-consistency regime; will likely "
+                       "show agreement collapse if one exists at this scale.",
+        "consistency_loss": "kl_softmax",
+        "consistency_lambda": 1.0,
+        "consistency_warmup_steps": 5000,
         "consistency_domain": "full_grid",
+    },
+    {
+        "name": "multi_kl_lam01_warm5k_trainonly",
+        "description": "Same as multi_kl_lam01_warm5k but consistency is "
+                       "enforced on train inputs only (no val-input leak). "
+                       "Controls for transductive contamination.",
+        "consistency_loss": "kl_softmax",
+        "consistency_lambda": 0.1,
+        "consistency_warmup_steps": 5000,
+        "consistency_domain": "train_inputs_only",
     },
 ]
 
@@ -178,10 +223,29 @@ def _build_cell_hparams(base: argparse.Namespace, cell: Dict[str, Any]) -> Names
     if not name:
         raise ValueError(f"Cell missing 'name': {cell!r}")
     h.experiment_name = name
+
+    kind = cell.get("kind", "consistency")
+    if kind not in ("consistency", "single_model"):
+        raise ValueError(
+            f"Cell {name!r} has unknown kind={kind!r}. "
+            "Allowed: 'consistency' (default), 'single_model'."
+        )
+    h.cell_kind = kind
+
     for k, v in cell.items():
-        if k in ("name", "description"):
+        if k in ("name", "description", "kind"):
             continue
         setattr(h, k, v)
+
+    # For a single-model baseline, force M=1 and disable consistency so the
+    # existing trainer takes the baseline code path (no unsup forward, no
+    # agreement term). The "shard" is then the full permuted train set.
+    if kind == "single_model":
+        h.n_models = 1
+        h.sharding = "disjoint"
+        h.consistency_loss = "none"
+        h.consistency_lambda = 0.0
+        h.consistency_warmup_steps = 0
     return h
 
 

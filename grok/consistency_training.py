@@ -156,9 +156,15 @@ class ConsistencyTrainer:
         log_every: int = 50,
     ) -> None:
         assert len(specialists) == len(shards)
-        assert len(specialists) >= 2, "Consistency requires at least 2 specialists."
+        assert len(specialists) >= 1, "Need at least one specialist."
         if consistency_loss not in ("none", "mse_logits", "kl_softmax"):
             raise ValueError(f"Unknown consistency_loss: {consistency_loss!r}")
+        if len(specialists) == 1 and consistency_loss != "none":
+            raise ValueError(
+                "Consistency loss requires M >= 2 specialists; got M=1 with "
+                f"consistency_loss={consistency_loss!r}. Use consistency_loss='none' "
+                "to run a single-model baseline through this trainer."
+            )
         if consistency_domain not in ("full_grid", "train_inputs_only"):
             raise ValueError(f"Unknown consistency_domain: {consistency_domain!r}")
 
@@ -301,21 +307,26 @@ class ConsistencyTrainer:
     def _consistency_loss(
         self, all_unsup_logits: List[torch.Tensor], i: int
     ) -> torch.Tensor:
-        if self.consistency_loss == "none":
+        if self.consistency_loss == "none" or self.M < 2:
             return torch.tensor(0.0, device=self.device)
-        # Build teacher target = mean of detached others, at answer position
-        others = [
+        others_logits = [
             all_unsup_logits[j][:, self.answer_pos, :].detach()
             for j in range(self.M)
             if j != i
         ]
-        teacher_ans = torch.stack(others, dim=0).mean(dim=0)
         student_ans = all_unsup_logits[i][:, self.answer_pos, :]
         if self.consistency_loss == "mse_logits":
+            # Mean of detached other logits, then MSE (classic Mean Teacher).
+            teacher_ans = torch.stack(others_logits, dim=0).mean(dim=0)
             return F.mse_loss(student_ans, teacher_ans)
         if self.consistency_loss == "kl_softmax":
+            # Average softmaxes of detached others (Hinton-style multi-teacher).
+            # softmax(mean(logits)) sharpens consensus; mean(softmax(logits))
+            # preserves per-teacher confidence and is the standard choice.
+            teacher_p = torch.stack(
+                [F.softmax(o, dim=-1) for o in others_logits], dim=0
+            ).mean(dim=0)
             student_log = F.log_softmax(student_ans, dim=-1)
-            teacher_p = F.softmax(teacher_ans, dim=-1)
             return F.kl_div(student_log, teacher_p, reduction="batchmean")
         raise RuntimeError(f"Unhandled consistency_loss: {self.consistency_loss}")
 
@@ -327,17 +338,19 @@ class ConsistencyTrainer:
         for spec in self.specialists:
             spec.train()
 
+        # Only run the unsup forward pass if it's actually needed. This skip
+        # saves ~20% compute on the single-model baseline and lam=0 cells.
+        need_unsup = self.consistency_loss != "none" and self.M >= 2
+
         for step in range(1, self.total_steps + 1):
             lam = self.lambda_t(step)
 
-            # Sample one shared unsup batch
-            unsup_text = self._sample_unsup()
-
-            # Forward all specialists on the unsup batch (with grad)
             unsup_logits: List[torch.Tensor] = []
-            for spec in self.specialists:
-                logits, _, _ = spec(unsup_text)
-                unsup_logits.append(logits)
+            if need_unsup:
+                unsup_text = self._sample_unsup()
+                for spec in self.specialists:
+                    logits, _, _ = spec(unsup_text)
+                    unsup_logits.append(logits)
 
             # Sample per-specialist shard batches and compute losses
             shard_ce: List[torch.Tensor] = []
