@@ -20,15 +20,17 @@ baseline (12%) and the multi-specialist-no-consistency baseline (1.4%) at
        decide whether the 21% result is a real effect or an init lottery
        driven by whichever specialist seed landed in a lucky basin.
 
-    [longer runs, 2 cells at 50k steps]
-    5. ``long_single_50pct_50k``   - single-model baseline at 50k steps.
+    [longer runs, 2 cells at 100k steps]
+    5. ``long_single_50pct_100k``  - single-model baseline at 100k steps.
                                    Checks whether the 12% plateau at 25k
                                    is budget-limited (still climbing) or
                                    architectural (would need a different
-                                   recipe to grok at all).
-    6. ``long_trainonly_lam01_50k`` - winning config at 50k steps. Checks
-                                   whether val acc keeps climbing past
-                                   25k or plateaus.
+                                   recipe to grok at all). 100k is ~4x
+                                   the grokking-transition budget reported
+                                   in the original grokking paper.
+    6. ``long_trainonly_lam01_100k`` - winning config at 100k steps.
+                                   Checks whether val acc keeps climbing
+                                   past 25k or plateaus.
 
     [lambda ablation on train_inputs_only, 3 cells]
     7. ``trainonly_lam003``        - same config as winner but lam=0.03.
@@ -158,24 +160,26 @@ DEFAULT_PILOT_CELLS: List[Dict[str, Any]] = [
         "random_seed": 45,
         **_WINNER_BASE,
     },
-    # --- 5-6: longer runs (50k steps) ------------------------------------
+    # --- 5-6: longer runs (100k steps) -----------------------------------
     {
-        "name": "long_single_50pct_50k",
-        "description": "Single-model on the 50% slice, 50k steps. Tells us "
+        "name": "long_single_50pct_100k",
+        "description": "Single-model on the 50% slice, 100k steps. Tells us "
                        "whether single-model-12%-at-25k is budget-limited "
-                       "(keeps climbing) or architectural (plateaued).",
+                       "(keeps climbing) or architectural (plateaued). 100k "
+                       "is ~4x the budget at which the original grokking "
+                       "paper reports its transition on modular arithmetic.",
         "kind": "single_model",
         "consistency_loss": "none",
         "consistency_lambda": 0.0,
         "consistency_warmup_steps": 0,
         "consistency_domain": "full_grid",
-        "consistency_steps": 50000,
+        "consistency_steps": 100000,
     },
     {
-        "name": "long_trainonly_lam01_50k",
-        "description": "Winning config at 50k steps. Tells us whether the "
+        "name": "long_trainonly_lam01_100k",
+        "description": "Winning config at 100k steps. Tells us whether the "
                        "21%-at-25k result keeps climbing or plateaus.",
-        "consistency_steps": 50000,
+        "consistency_steps": 100000,
         **_WINNER_BASE,
     },
     # --- 7-9: lambda ablation on train_inputs_only ------------------------
