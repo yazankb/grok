@@ -5,36 +5,40 @@ Runs a configurable list of cells (each cell = one full training run) and
 writes a top-level ``sweep_summary.json`` indexing all per-run results. Each
 cell creates its own subdirectory under ``--logdir/<sweep_name>/<cell_name>``.
 
-Default pilot is v2 (see ``reports/consistency_regularized_grokking_plan.md``
-§8 revision): 5 cells covering
+Default pilot is v3 (see ``reports/consistency_regularized_grokking_plan.md``
+§8 revision). Based on the v2 results the headline finding was that
+``train_inputs_only`` KL-softmax consistency at lambda=0.1 (21% ensemble val
+acc, best specialist 29%) substantially beats both the single-model-on-50%
+baseline (12%) and the multi-specialist-no-consistency baseline (1.4%) at
+25k steps. v3 is three micro-sweeps on that winning configuration:
 
-    1. ``single_model_50pct``     - single model trained on the 50%-shard (M=1)
-                                   baseline; calibrates what grokking looks
-                                   like without multi-specialist dynamics.
-    2. ``multi_lam0``              - multi-specialist, consistency off.
-                                   Calibrates ensemble/merged acc baseline.
-    3. ``multi_kl_lam01_warm5k``   - KL-softmax, lam=0.1, 5k-step warmup.
-                                   Headline consistency cell.
-    4. ``multi_kl_lam1_warm5k``    - KL-softmax, lam=1.0, 5k-step warmup.
-                                   Probes whether stronger consistency helps
-                                   or triggers agreement collapse.
-    5. ``multi_kl_lam01_warm5k_trainonly``
-                                   - same as #3 but consistency is enforced
-                                   on ``train_inputs_only`` rather than the
-                                   full grid. Controls for transductive leak.
+    [seed robustness, 4 cells]
+    1. ``seed42_trainonly_lam01``  - reruns the pilot_v2 winner (seed 42).
+    2. ``seed43_trainonly_lam01``  - same config, seed 43.
+    3. ``seed44_trainonly_lam01``  - same config, seed 44.
+    4. ``seed45_trainonly_lam01``  - same config, seed 45. Together these
+       decide whether the 21% result is a real effect or an init lottery
+       driven by whichever specialist seed landed in a lucky basin.
 
-v2 fixes two bugs identified in the v1 pilot (see the updated plan):
-- MSE-on-logits was not scale-matched to CE; we switch to KL-on-softmax which
-  has comparable magnitudes across training.
-- 1k-step warmup was too short on a 25k-step budget; models collapsed to flat
-  outputs before they had a chance to memorise. We use 5k-step warmup.
-- The missing single-model-on-50% baseline is added so we can interpret the
-  multi-specialist cells quantitatively.
+    [longer runs, 2 cells at 50k steps]
+    5. ``long_single_50pct_50k``   - single-model baseline at 50k steps.
+                                   Checks whether the 12% plateau at 25k
+                                   is budget-limited (still climbing) or
+                                   architectural (would need a different
+                                   recipe to grok at all).
+    6. ``long_trainonly_lam01_50k`` - winning config at 50k steps. Checks
+                                   whether val acc keeps climbing past
+                                   25k or plateaus.
+
+    [lambda ablation on train_inputs_only, 3 cells]
+    7. ``trainonly_lam003``        - same config as winner but lam=0.03.
+    8. ``trainonly_lam03``         - lam=0.3.
+    9. ``trainonly_lam10``         - lam=1.0. (lam=0.1 is covered by cell 1.)
 
 Example (Kaggle, T4 GPU)::
 
     python scripts/run_consistency_sweep.py \
-        --sweep_name pilot_v2 \
+        --sweep_name pilot_v3 \
         --logdir /kaggle/working/consistency_runs \
         --consistency_steps 25000 \
         --gpu 0
@@ -70,7 +74,7 @@ from typing import Any, Dict, List, Optional
 def _make_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__)
     # Sweep metadata
-    p.add_argument("--sweep_name", type=str, default="pilot_v2",
+    p.add_argument("--sweep_name", type=str, default="pilot_v3",
                    help="Top-level subdirectory name for this sweep.")
     p.add_argument("--cells_json", type=str, default=None,
                    help="Optional path to a JSON list of cell-overrides "
@@ -113,64 +117,86 @@ def _make_parser() -> argparse.ArgumentParser:
     return p
 
 
-# Pilot sweep v2: 5 runs. Cells 1 and 2 calibrate baselines; cells 3-5
-# perturb lambda, strength-of-consistency, and consistency domain on an
-# otherwise identical setup. KL-softmax (not MSE-on-logits) and 5k warmup
-# (not 1k) come from the v1-pilot post-mortem in the plan §8 revision.
+# Pilot sweep v3: 9 runs, three micro-sweeps on the pilot_v2 winner
+# (multi_kl_lam01_warm5k_trainonly: KL-softmax, lam=0.1, 5k warmup,
+# train_inputs_only). See the module docstring for the rationale and the
+# "winner" reference in reports/consistency_regularized_grokking_plan.md.
+_WINNER_BASE: Dict[str, Any] = {
+    "consistency_loss": "kl_softmax",
+    "consistency_lambda": 0.1,
+    "consistency_warmup_steps": 5000,
+    "consistency_domain": "train_inputs_only",
+}
+
 DEFAULT_PILOT_CELLS: List[Dict[str, Any]] = [
+    # --- 1-4: seed robustness on the winning config -----------------------
     {
-        "name": "single_model_50pct",
-        "description": "Single model on the 50% train slice. Baseline that "
-                       "calibrates what grokking looks like without any "
-                       "multi-specialist or consistency dynamics.",
+        "name": "seed42_trainonly_lam01",
+        "description": "Seed 42 (pilot_v2 winner). Establishes the anchor "
+                       "for the 3 additional-seed reruns in cells 2-4.",
+        "random_seed": 42,
+        **_WINNER_BASE,
+    },
+    {
+        "name": "seed43_trainonly_lam01",
+        "description": "Seed 43 of the winning config. Different shard "
+                       "permutation and different specialist inits.",
+        "random_seed": 43,
+        **_WINNER_BASE,
+    },
+    {
+        "name": "seed44_trainonly_lam01",
+        "description": "Seed 44 of the winning config.",
+        "random_seed": 44,
+        **_WINNER_BASE,
+    },
+    {
+        "name": "seed45_trainonly_lam01",
+        "description": "Seed 45 of the winning config. If all four seeds "
+                       "produce 15-25% ensemble val acc with a ~25-30% "
+                       "breakout specialist, the co-training story is real.",
+        "random_seed": 45,
+        **_WINNER_BASE,
+    },
+    # --- 5-6: longer runs (50k steps) ------------------------------------
+    {
+        "name": "long_single_50pct_50k",
+        "description": "Single-model on the 50% slice, 50k steps. Tells us "
+                       "whether single-model-12%-at-25k is budget-limited "
+                       "(keeps climbing) or architectural (plateaued).",
         "kind": "single_model",
-        # The remaining consistency fields are ignored for kind=single_model
-        # (consistency_loss is forced to 'none' and n_models to 1), but we
-        # set them explicitly so the run config is unambiguous.
         "consistency_loss": "none",
         "consistency_lambda": 0.0,
         "consistency_warmup_steps": 0,
         "consistency_domain": "full_grid",
+        "consistency_steps": 50000,
     },
     {
-        "name": "multi_lam0",
-        "description": "Multi-specialist (M=4, disjoint shards), no "
-                       "consistency. Calibrates ensemble/merged val acc with "
-                       "only CE on shards.",
-        "consistency_loss": "none",
-        "consistency_lambda": 0.0,
-        "consistency_warmup_steps": 0,
-        "consistency_domain": "full_grid",
+        "name": "long_trainonly_lam01_50k",
+        "description": "Winning config at 50k steps. Tells us whether the "
+                       "21%-at-25k result keeps climbing or plateaus.",
+        "consistency_steps": 50000,
+        **_WINNER_BASE,
+    },
+    # --- 7-9: lambda ablation on train_inputs_only ------------------------
+    {
+        "name": "trainonly_lam003",
+        "description": "Winning config but lam=0.03. Probes the weak-lambda "
+                       "tail to see whether less consistency also works.",
+        **{**_WINNER_BASE, "consistency_lambda": 0.03},
     },
     {
-        "name": "multi_kl_lam01_warm5k",
-        "description": "KL-softmax consistency, lam=0.1, 5k-step warmup on "
-                       "25k total. Headline candidate: weak consistency "
-                       "after memorisation has a chance to start.",
-        "consistency_loss": "kl_softmax",
-        "consistency_lambda": 0.1,
-        "consistency_warmup_steps": 5000,
-        "consistency_domain": "full_grid",
+        "name": "trainonly_lam03",
+        "description": "Winning config but lam=0.3. Probes the midpoint.",
+        **{**_WINNER_BASE, "consistency_lambda": 0.3},
     },
     {
-        "name": "multi_kl_lam1_warm5k",
-        "description": "KL-softmax consistency, lam=1.0, 5k-step warmup. "
-                       "Bounds the strong-consistency regime; will likely "
-                       "show agreement collapse if one exists at this scale.",
-        "consistency_loss": "kl_softmax",
-        "consistency_lambda": 1.0,
-        "consistency_warmup_steps": 5000,
-        "consistency_domain": "full_grid",
-    },
-    {
-        "name": "multi_kl_lam01_warm5k_trainonly",
-        "description": "Same as multi_kl_lam01_warm5k but consistency is "
-                       "enforced on train inputs only (no val-input leak). "
-                       "Controls for transductive contamination.",
-        "consistency_loss": "kl_softmax",
-        "consistency_lambda": 0.1,
-        "consistency_warmup_steps": 5000,
-        "consistency_domain": "train_inputs_only",
+        "name": "trainonly_lam10",
+        "description": "Winning config but lam=1.0. Strong-consistency bound "
+                       "on train_inputs_only. Compare against the lam=1.0 "
+                       "full-grid cell from pilot_v2 to isolate the domain "
+                       "effect at high lambda.",
+        **{**_WINNER_BASE, "consistency_lambda": 1.0},
     },
 ]
 
