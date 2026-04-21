@@ -309,38 +309,56 @@ class ConsistencyTrainer:
     def _infonce_loss(
         self, all_unsup_logits: List[torch.Tensor], i: int
     ) -> torch.Tensor:
-        """
-        InfoNCE contrastive loss.
+        """Multi-positive InfoNCE contrastive loss with cross-specialist negatives.
 
-        Positives: same input through different specialists -> higher similarity
-        Negatives: different inputs -> lower similarity
+        Uses cosine similarity (standard for InfoNCE).
+
+        Positives: same input through different specialists (M-1 positives, all targeted).
+        Negatives: different inputs through all specialists (M*(B-1) negatives).
+
+        Teacher embeddings (j != i) are stop-gradient'd so gradients only flow
+        into specialist i's parameters.
         """
         B = all_unsup_logits[0].shape[0]
         M = self.M
         T = self.infonce_temp
 
-        all_embeds = [
-            all_unsup_logits[j][:, self.answer_pos, :].float() for j in range(M)
-        ]
-        embed_i = all_embeds[i]
+        # L2-normalize for cosine similarity
+        # Student (i) keeps gradients; teachers (j != i) are detached
+        all_embeds = []
+        for j in range(M):
+            emb = all_unsup_logits[j][:, self.answer_pos, :].float()
+            if j != i:
+                emb = emb.detach()
+            all_embeds.append(F.normalize(emb, dim=-1))
 
-        pos_sims = []
+        embed_i = all_embeds[i]  # [B, D]
+
+        # Build all similarity scores: [B, M*B]
+        # Column j*B + b corresponds to cos(embed_i[b], embed_j[b])
+        all_sims = []
+        for j in range(M):
+            sim_matrix = embed_i @ all_embeds[j].T  # [B, B]
+            all_sims.append(sim_matrix)
+
+        all_sims = torch.cat(all_sims, dim=1)  # [B, M*B]
+
+        # Mask out self-pair (i, b) for each row b
+        self_cols = torch.arange(B, device=embed_i.device) + i * B
+        all_sims[torch.arange(B), self_cols] = float("-inf")
+
+        # Multi-positive InfoNCE: average negative log-prob over all M-1 positives
+        logits = all_sims / T
+        log_softmax = F.log_softmax(logits, dim=-1)  # [B, M*B]
+
+        loss = torch.tensor(0.0, device=embed_i.device)
         for j in range(M):
             if j != i:
-                sim = -(embed_i - all_embeds[j]).pow(2).sum(dim=-1)
-                pos_sims.append(sim)
-        pos_sims = torch.stack(pos_sims, dim=1)
+                pos_cols = torch.arange(B, device=embed_i.device) + j * B
+                loss = loss - log_softmax[torch.arange(B), pos_cols].mean()
+        loss = loss / (M - 1)
 
-        neg_matrix = torch.cdist(embed_i, embed_i, p=2).pow(2)
-        neg_mask = ~torch.eye(B, dtype=torch.bool, device=embed_i.device)
-        neg_sims = -neg_matrix.masked_fill(~neg_mask, float('inf'))
-        neg_sims = neg_sims.clamp(-1e4, 1e4)
-
-        logits = torch.cat([pos_sims, neg_sims], dim=1) / T
-        logits = logits.clamp(-1e4, 1e4)
-
-        labels = torch.zeros(B, dtype=torch.long, device=embed_i.device)
-        return F.cross_entropy(logits, labels)
+        return loss
 
     def _consistency_loss(
         self, all_unsup_logits: List[torch.Tensor], i: int
