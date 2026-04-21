@@ -154,6 +154,7 @@ class ConsistencyTrainer:
         eval_every: int = 500,
         checkpoint_every: int = 5000,
         log_every: int = 50,
+        infonce_temperature: float = 0.1,
     ) -> None:
         assert len(specialists) == len(shards)
         assert len(specialists) >= 1, "Need at least one specialist."
@@ -187,7 +188,7 @@ class ConsistencyTrainer:
         self.eval_every = int(eval_every)
         self.checkpoint_every = int(checkpoint_every)
         self.log_every = int(log_every)
-        self.infonce_temp = getattr(hparams, "infonce_temperature", 0.1)
+        self.infonce_temp = float(infonce_temperature)
 
         self.M = len(specialists)
         self.tokenizer = full_train_ds.tokenizer
@@ -755,6 +756,7 @@ def train_multi_with_consistency(hparams: Namespace) -> str:
         eval_every=hparams.eval_every,
         checkpoint_every=hparams.checkpoint_every,
         log_every=hparams.log_every,
+        infonce_temperature=hparams.infonce_temperature,
     )
 
     summary = trainer.fit()
