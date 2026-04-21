@@ -255,21 +255,34 @@ class ConsistencyTrainer:
             _ProjectionHead(vocab_dim) for _ in range(self.M)
         ]).to(self.device)
 
-        # Move all specialists to device and build optimizers
+        # Move all specialists to device and build optimizers + schedulers
+        # Projection head params are added BEFORE creating the scheduler to
+        # avoid the "zip() argument 2 is shorter" error (LambdaLR stores the
+        # number of param groups at creation time).
         self.optimizers: List[torch.optim.Optimizer] = []
         self.schedulers: List[Any] = []
         for idx, spec in enumerate(self.specialists):
             spec.to(self.device)
-            opts, scheds = spec.configure_optimizers()
-            opt = opts[0]
-            # Add projection head parameters to optimizer
-            for p in self.proj_heads[idx].parameters():
-                opt.add_param_group({"params": p, "lr": opt.param_groups[0]["lr"], "weight_decay": opt.param_groups[0].get("weight_decay", 0)})
+
+            # Build optimizer with projection head params included
+            all_params = list(spec.parameters()) + list(self.proj_heads[idx].parameters())
+            from grok.training import CustomAdamW
+            opt = CustomAdamW(
+                all_params,
+                betas=(0.9, 0.98),
+                eps=1e-8,
+                lr=1,
+                weight_decay=spec.hparams.weight_decay,
+                noise_factor=spec.hparams.noise_factor if hasattr(spec.hparams, "noise_factor") else 0,
+                weight_decay_form=spec.hparams.weight_decay_kind if hasattr(spec.hparams, "weight_decay_kind") else "to_zero",
+            )
+
+            # Build scheduler (must be created after optimizer has all param groups)
+            from torch.optim.lr_scheduler import LambdaLR
+            sched = LambdaLR(opt, lr_lambda=spec._scheduler_lr)
+
             self.optimizers.append(opt)
-            if scheds and isinstance(scheds[0], dict):
-                self.schedulers.append(scheds[0]["scheduler"])
-            else:
-                self.schedulers.append(None)
+            self.schedulers.append(sched)
 
         # Build the unsup tensor once. ``data`` is a [N, seq_len] tensor of
         # token ids; we slice off the trailing token to match the model's
