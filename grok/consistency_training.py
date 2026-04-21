@@ -311,7 +311,7 @@ class ConsistencyTrainer:
     ) -> torch.Tensor:
         """Multi-positive InfoNCE contrastive loss with cross-specialist negatives.
 
-        Uses cosine similarity (standard for InfoNCE).
+        Uses negative squared L2 distance as similarity metric.
 
         Positives: same input through different specialists (M-1 positives, all targeted).
         Negatives: different inputs through all specialists (M*(B-1) negatives).
@@ -323,22 +323,23 @@ class ConsistencyTrainer:
         M = self.M
         T = self.infonce_temp
 
-        # L2-normalize for cosine similarity
         # Student (i) keeps gradients; teachers (j != i) are detached
         all_embeds = []
         for j in range(M):
             emb = all_unsup_logits[j][:, self.answer_pos, :].float()
             if j != i:
                 emb = emb.detach()
-            all_embeds.append(F.normalize(emb, dim=-1))
+            all_embeds.append(emb)
 
         embed_i = all_embeds[i]  # [B, D]
 
         # Build all similarity scores: [B, M*B]
-        # Column j*B + b corresponds to cos(embed_i[b], embed_j[b])
+        # sim = -||embed_i[b] - embed_j[b']||^2 (higher = more similar)
         all_sims = []
         for j in range(M):
-            sim_matrix = embed_i @ all_embeds[j].T  # [B, B]
+            # [B, D] vs [B, D] -> [B, B] pairwise squared distances
+            dist_sq = torch.cdist(embed_i, all_embeds[j], p=2).pow(2)
+            sim_matrix = -dist_sq
             all_sims.append(sim_matrix)
 
         all_sims = torch.cat(all_sims, dim=1)  # [B, M*B]
