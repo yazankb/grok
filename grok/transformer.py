@@ -310,10 +310,13 @@ class Transformer(nn.Module):
         x: Tensor,
         pos: int = None,
         save_activations: bool = False,
+        return_hidden: bool = False,
     ) -> Tuple[Tensor, Union[Tensor, None], Union[Tensor, None]]:
         """parameters:
         x:  (rank-1 tensor) vocab indices of decoder input token
                      sequence"""
+        # return_hidden: if True, also return hidden state before final linear layer
+        #              as fourth element (Tensor, Tensor, Tensor, Tensor)
 
         x = x.to(self.embedding.weight.device)
 
@@ -331,4 +334,7 @@ class Transformer(nn.Module):
             decoded = decoded[:, pos, :]
 
         y_hat = self.linear(decoded)
+
+        if return_hidden:
+            return y_hat, decoded, attentions, values
         return y_hat, attentions, values

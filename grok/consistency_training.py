@@ -60,36 +60,14 @@ from grok.multi_training import (
 class _ProjectionHead(torch.nn.Module):
     """Two-layer MLP projection head for contrastive learning.
 
-    Maps vocab-sized logits -> low-dim embedding space optimized for
+    Maps d_model hidden state -> low-dim embedding space optimized for
     similarity comparison, following SimCLR/MoCo conventions.
     """
 
-    def __init__(self, vocab_size: int, hidden_dim: int = 128, out_dim: int = 64) -> None:
+    def __init__(self, d_model: int, hidden_dim: int = 128, out_dim: int = 64) -> None:
         super().__init__()
         self.net = torch.nn.Sequential(
-            torch.nn.Linear(vocab_size, hidden_dim),
-            torch.nn.ReLU(inplace=True),
-            torch.nn.Linear(hidden_dim, out_dim, bias=False),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)
-
-
-# ---------------------------------------------------------------------------
-
-
-class _ProjectionHead(torch.nn.Module):
-    """Two-layer MLP projection head for contrastive learning.
-
-    Maps vocab-sized logits -> low-dim embedding space optimized for
-    similarity comparison, following SimCLR/MoCo conventions.
-    """
-
-    def __init__(self, vocab_size: int, hidden_dim: int = 128, out_dim: int = 64) -> None:
-        super().__init__()
-        self.net = torch.nn.Sequential(
-            torch.nn.Linear(vocab_size, hidden_dim),
+            torch.nn.Linear(d_model, hidden_dim),
             torch.nn.ReLU(inplace=True),
             torch.nn.Linear(hidden_dim, out_dim, bias=False),
         )
@@ -248,23 +226,19 @@ class ConsistencyTrainer:
         self.answer_pos = _answer_logit_position(self.eq_pos)
 
         # Build projection heads for InfoNCE (one per specialist)
-        vocab_size = full_train_ds.data.shape[1]  # not vocab, need actual vocab size
-        # Get vocab size from the model's linear layer
-        vocab_dim = specialists[0].transformer.linear.out_features
+        # Project from d_model hidden state -> 64-d embedding (SimCLR-style)
+        d_model = specialists[0].transformer.d_model
         self.proj_heads = torch.nn.ModuleList([
-            _ProjectionHead(vocab_dim) for _ in range(self.M)
+            _ProjectionHead(d_model) for _ in range(self.M)
         ]).to(self.device)
 
         # Move all specialists to device and build optimizers + schedulers
-        # Projection head params are added BEFORE creating the scheduler to
-        # avoid the "zip() argument 2 is shorter" error (LambdaLR stores the
-        # number of param groups at creation time).
+        # Projection head params must be included in optimizer before scheduler creation
         self.optimizers: List[torch.optim.Optimizer] = []
         self.schedulers: List[Any] = []
         for idx, spec in enumerate(self.specialists):
             spec.to(self.device)
-
-            # Build optimizer with projection head params included
+            # All params: transformer + projection head
             all_params = list(spec.parameters()) + list(self.proj_heads[idx].parameters())
             from grok.training import CustomAdamW
             opt = CustomAdamW(
@@ -276,11 +250,8 @@ class ConsistencyTrainer:
                 noise_factor=spec.hparams.noise_factor if hasattr(spec.hparams, "noise_factor") else 0,
                 weight_decay_form=spec.hparams.weight_decay_kind if hasattr(spec.hparams, "weight_decay_kind") else "to_zero",
             )
-
-            # Build scheduler (must be created after optimizer has all param groups)
             from torch.optim.lr_scheduler import LambdaLR
             sched = LambdaLR(opt, lr_lambda=spec._scheduler_lr)
-
             self.optimizers.append(opt)
             self.schedulers.append(sched)
 
@@ -378,39 +349,40 @@ class ConsistencyTrainer:
     # ------------------------------------------------------------------
 
     def _infonce_loss(
-        self, all_unsup_logits: List[torch.Tensor], i: int
+        self, all_unsup_logits: List[torch.Tensor], all_unsup_hidden: List[torch.Tensor], i: int
     ) -> torch.Tensor:
-        """Multi-positive InfoNCE contrastive loss with cross-specialist negatives.
+        """Multi-positive InfoNCE contrastive loss with projection head on hidden states.
 
         Uses negative squared L2 distance on projection-head embeddings.
 
+        Architecture (SimCLR-style):
+          hidden state (d_model) -> projection head -> embedding (64-d) -> contrastive loss
+
         Positives: same input through different specialists (M-1 positives, all targeted).
         Negatives: different inputs through all specialists (M*(B-1) negatives).
-
-        Teacher embeddings (j != i) are stop-gradient'd so gradients only flow
-        into specialist i's parameters.
         """
         B = all_unsup_logits[0].shape[0]
         M = self.M
         T = self.infonce_temp
 
-        # Extract answer-position logits and project through heads
+        # Extract answer-position hidden states and project through heads
         # Student (i) keeps gradients; teachers (j != i) are detached
         all_embeds = []
         for j in range(M):
-            logits_at_answer = all_unsup_logits[j][:, self.answer_pos, :].float()
-            emb = self.proj_heads[j](logits_at_answer)
+            hidden_at_answer = all_unsup_hidden[j][:, self.answer_pos, :].float()
+            # Project from d_model -> 64-d
+            emb = self.proj_heads[j](hidden_at_answer)
             if j != i:
                 emb = emb.detach()
+            # L2-normalize for cosine similarity
             all_embeds.append(F.normalize(emb, dim=-1))
 
-        embed_i = all_embeds[i]  # [B, D]
+        embed_i = all_embeds[i]  # [B, 64]
 
         # Build all similarity scores: [B, M*B]
         # sim = -||embed_i[b] - embed_j[b']||^2 (higher = more similar)
         all_sims = []
         for j in range(M):
-            # [B, D] vs [B, D] -> [B, B] pairwise squared distances
             dist_sq = torch.cdist(embed_i, all_embeds[j], p=2).pow(2)
             sim_matrix = -dist_sq
             all_sims.append(sim_matrix)
@@ -423,7 +395,7 @@ class ConsistencyTrainer:
 
         # Multi-positive InfoNCE: average negative log-prob over all M-1 positives
         logits = all_sims / T
-        log_softmax = F.log_softmax(logits, dim=-1)  # [B, M*B]
+        log_softmax = F.log_softmax(logits, dim=-1)
 
         loss = torch.tensor(0.0, device=embed_i.device)
         for j in range(M):
@@ -435,7 +407,7 @@ class ConsistencyTrainer:
         return loss
 
     def _consistency_loss(
-        self, all_unsup_logits: List[torch.Tensor], i: int
+        self, all_unsup_logits: List[torch.Tensor], all_unsup_hidden: List[torch.Tensor], i: int
     ) -> torch.Tensor:
         if self.consistency_loss == "none" or self.M < 2:
             return torch.tensor(0.0, device=self.device)
@@ -455,7 +427,7 @@ class ConsistencyTrainer:
             student_log = F.log_softmax(student_ans, dim=-1)
             return F.kl_div(student_log, teacher_p, reduction="batchmean")
         if self.consistency_loss == "infonce":
-            return self._infonce_loss(all_unsup_logits, i)
+            return self._infonce_loss(all_unsup_logits, all_unsup_hidden, i)
         raise RuntimeError(f"Unhandled consistency_loss: {self.consistency_loss}")
 
     # ------------------------------------------------------------------
@@ -474,11 +446,14 @@ class ConsistencyTrainer:
             lam = self.lambda_t(step)
 
             unsup_logits: List[torch.Tensor] = []
+            unsup_hidden: List[torch.Tensor] = []
             if need_unsup:
                 unsup_text = self._sample_unsup()
                 for spec in self.specialists:
-                    logits, _, _ = spec(unsup_text)
+                    # Get both logits and hidden state (d_model) from transformer
+                    logits, hidden = spec.forward_with_hidden(unsup_text)
                     unsup_logits.append(logits)
+                    unsup_hidden.append(hidden)
 
             # Sample per-specialist shard batches and compute losses
             shard_ce: List[torch.Tensor] = []
@@ -499,7 +474,7 @@ class ConsistencyTrainer:
                 shard_ce.append(ce.detach())
                 with torch.no_grad():
                     shard_acc.append(_rhs_accuracy(logits, target, self.eq_pos))
-                cons = self._consistency_loss(unsup_logits, i)
+                cons = self._consistency_loss(unsup_logits, unsup_hidden, i)
                 cons_losses.append(cons.detach())
                 if lam > 0 and self.consistency_loss != "none":
                     total_loss = total_loss + ce + lam * cons
@@ -732,7 +707,6 @@ class ConsistencyTrainer:
             torch.save(
                 {
                     "transformer_state_dict": spec.transformer.state_dict(),
-                    "proj_head_state_dict": self.proj_heads[i].state_dict(),
                     "step": step,
                     "specialist_index": i,
                 },

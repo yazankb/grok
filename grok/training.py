@@ -691,6 +691,16 @@ class TrainableTransformer(LightningModule):
         """Passes all arguments directly to Tranformer.forward()"""
         return self.transformer(*args, **kwargs)
 
+    def forward_with_hidden(self, x: Tensor) -> Tuple[Tensor, Tensor]:
+        """Forward returning both logits and hidden state.
+
+        Returns:
+            logits: [B, seq, vocab]
+            hidden: [B, seq, d_model]
+        """
+        logits, hidden, _, _ = self.transformer(x, return_hidden=True)
+        return logits, hidden
+
 
 def train(hparams: Namespace) -> None:
     """
