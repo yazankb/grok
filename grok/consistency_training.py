@@ -53,6 +53,52 @@ from grok.multi_training import (
 
 
 # ---------------------------------------------------------------------------
+# Projection head for InfoNCE
+# ---------------------------------------------------------------------------
+
+
+class _ProjectionHead(torch.nn.Module):
+    """Two-layer MLP projection head for contrastive learning.
+
+    Maps vocab-sized logits -> low-dim embedding space optimized for
+    similarity comparison, following SimCLR/MoCo conventions.
+    """
+
+    def __init__(self, vocab_size: int, hidden_dim: int = 128, out_dim: int = 64) -> None:
+        super().__init__()
+        self.net = torch.nn.Sequential(
+            torch.nn.Linear(vocab_size, hidden_dim),
+            torch.nn.ReLU(inplace=True),
+            torch.nn.Linear(hidden_dim, out_dim, bias=False),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
+# ---------------------------------------------------------------------------
+
+
+class _ProjectionHead(torch.nn.Module):
+    """Two-layer MLP projection head for contrastive learning.
+
+    Maps vocab-sized logits -> low-dim embedding space optimized for
+    similarity comparison, following SimCLR/MoCo conventions.
+    """
+
+    def __init__(self, vocab_size: int, hidden_dim: int = 128, out_dim: int = 64) -> None:
+        super().__init__()
+        self.net = torch.nn.Sequential(
+            torch.nn.Linear(vocab_size, hidden_dim),
+            torch.nn.ReLU(inplace=True),
+            torch.nn.Linear(hidden_dim, out_dim, bias=False),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
@@ -201,13 +247,25 @@ class ConsistencyTrainer:
         self.eq_pos = _eq_token_position_in_target(target_tensor, eq_token_id)
         self.answer_pos = _answer_logit_position(self.eq_pos)
 
+        # Build projection heads for InfoNCE (one per specialist)
+        vocab_size = full_train_ds.data.shape[1]  # not vocab, need actual vocab size
+        # Get vocab size from the model's linear layer
+        vocab_dim = specialists[0].transformer.linear.out_features
+        self.proj_heads = torch.nn.ModuleList([
+            _ProjectionHead(vocab_dim) for _ in range(self.M)
+        ]).to(self.device)
+
         # Move all specialists to device and build optimizers
         self.optimizers: List[torch.optim.Optimizer] = []
         self.schedulers: List[Any] = []
-        for spec in self.specialists:
+        for idx, spec in enumerate(self.specialists):
             spec.to(self.device)
             opts, scheds = spec.configure_optimizers()
-            self.optimizers.append(opts[0])
+            opt = opts[0]
+            # Add projection head parameters to optimizer
+            for p in self.proj_heads[idx].parameters():
+                opt.add_param_group({"params": p, "lr": opt.param_groups[0]["lr"], "weight_decay": opt.param_groups[0].get("weight_decay", 0)})
+            self.optimizers.append(opt)
             if scheds and isinstance(scheds[0], dict):
                 self.schedulers.append(scheds[0]["scheduler"])
             else:
@@ -311,7 +369,7 @@ class ConsistencyTrainer:
     ) -> torch.Tensor:
         """Multi-positive InfoNCE contrastive loss with cross-specialist negatives.
 
-        Uses negative squared L2 distance as similarity metric.
+        Uses negative squared L2 distance on projection-head embeddings.
 
         Positives: same input through different specialists (M-1 positives, all targeted).
         Negatives: different inputs through all specialists (M*(B-1) negatives).
@@ -323,13 +381,15 @@ class ConsistencyTrainer:
         M = self.M
         T = self.infonce_temp
 
+        # Extract answer-position logits and project through heads
         # Student (i) keeps gradients; teachers (j != i) are detached
         all_embeds = []
         for j in range(M):
-            emb = all_unsup_logits[j][:, self.answer_pos, :].float()
+            logits_at_answer = all_unsup_logits[j][:, self.answer_pos, :].float()
+            emb = self.proj_heads[j](logits_at_answer)
             if j != i:
                 emb = emb.detach()
-            all_embeds.append(emb)
+            all_embeds.append(F.normalize(emb, dim=-1))
 
         embed_i = all_embeds[i]  # [B, D]
 
@@ -659,6 +719,7 @@ class ConsistencyTrainer:
             torch.save(
                 {
                     "transformer_state_dict": spec.transformer.state_dict(),
+                    "proj_head_state_dict": self.proj_heads[i].state_dict(),
                     "step": step,
                     "specialist_index": i,
                 },
