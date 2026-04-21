@@ -212,6 +212,7 @@ def _build_cell_hparams(base: argparse.Namespace, cell: Dict[str, Any]) -> Names
         eval_every=base.eval_every,
         checkpoint_every=base.checkpoint_every,
         log_every=base.log_every,
+        infonce_temperature=base.infonce_temperature,
     )
     name = cell.get("name")
     if not name:
