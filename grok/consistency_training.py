@@ -310,52 +310,34 @@ class ConsistencyTrainer:
         self, all_unsup_logits: List[torch.Tensor], i: int
     ) -> torch.Tensor:
         """
-        InfoNCE-style contrastive loss with L2 distance for multi-specialist alignment.
+        InfoNCE contrastive loss.
 
-        For each sample b in batch:
-        - Positive: same input through other specialists -> L2 squared distance minimized
-        - Negative: same specialist on different samples -> pushed apart via softmax
-
-        View embeddings as shape [B, M] where B=batch, M=num_specialists.
-        We contrast: (spec_i on sample_b) should be similar to (spec_j on sample_b) for j!=i
-                    but different from (spec_i on sample_k) for k!=b
+        Positives: same input through different specialists -> higher similarity
+        Negatives: different inputs -> lower similarity
         """
         B = all_unsup_logits[0].shape[0]
         M = self.M
         T = self.infonce_temp
 
         all_embeds = [
-            all_unsup_logits[j][:, self.answer_pos, :] for j in range(M)
+            all_unsup_logits[j][:, self.answer_pos, :].float() for j in range(M)
         ]
-
         embed_i = all_embeds[i]
 
-        pos_scores = []
+        pos_sims = []
         for j in range(M):
-            if j == i:
-                continue
-            dist_sq = (embed_i - all_embeds[j]).pow(2).sum(dim=-1)
-            pos_scores.append(-dist_sq)
-        pos_scores = torch.stack(pos_scores, dim=1)
+            if j != i:
+                sim = -(embed_i - all_embeds[j]).pow(2).sum(dim=-1)
+                pos_sims.append(sim)
+        pos_sims = torch.stack(pos_sims, dim=1)
 
-        all_neg_scores_list = []
+        neg_matrix = torch.cdist(embed_i, embed_i, p=2).pow(2)
+        neg_mask = ~torch.eye(B, dtype=torch.bool, device=embed_i.device)
+        neg_sims = -neg_matrix.masked_fill(~neg_mask, float('inf'))
+        neg_sims = neg_sims.clamp(-1e4, 1e4)
 
-        neg_mask = torch.ones(B, B, dtype=torch.bool, device=embed_i.device)
-        neg_mask.fill_diagonal_(False)
-        neg_dists_sq = (embed_i.unsqueeze(1) - embed_i.unsqueeze(0)).pow(2).sum(dim=-1)
-        neg_i_on_diff = -neg_dists_sq.masked_fill(~neg_mask, float('-inf'))
-        all_neg_scores_list.append(neg_i_on_diff)
-
-        for j in range(M):
-            if j == i:
-                continue
-            embed_j = all_embeds[j]
-            neg_dists_other = (embed_i.unsqueeze(1) - embed_j.unsqueeze(0)).pow(2).sum(dim=-1)
-            all_neg_scores_list.append(-neg_dists_other)
-
-        neg_scores = torch.cat(all_neg_scores_list, dim=1)
-
-        logits = torch.cat([pos_scores, neg_scores], dim=1) / T
+        logits = torch.cat([pos_sims, neg_sims], dim=1) / T
+        logits = logits.clamp(-1e4, 1e4)
 
         labels = torch.zeros(B, dtype=torch.long, device=embed_i.device)
         return F.cross_entropy(logits, labels)
