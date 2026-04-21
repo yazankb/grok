@@ -184,7 +184,7 @@ class ConsistencyTrainer:
         assert len(specialists) >= 1, "Need at least one specialist."
         if consistency_loss not in ("none", "mse_logits", "kl_softmax", "infonce"):
             raise ValueError(f"Unknown consistency_loss: {consistency_loss!r}")
-        if len(specialists) == 1 and consistency_loss not in ("none", "infonce"):
+        if len(specialists) == 1 and consistency_loss != "none":
             raise ValueError(
                 "Consistency loss requires M >= 2 specialists; got M=1 with "
                 f"consistency_loss={consistency_loss!r}. Use consistency_loss='none' "
@@ -351,60 +351,64 @@ class ConsistencyTrainer:
     def _infonce_loss(
         self, all_unsup_logits: List[torch.Tensor], all_unsup_hidden: List[torch.Tensor], i: int
     ) -> torch.Tensor:
-        """Multi-positive InfoNCE contrastive loss with projection head on hidden states.
-
-        Uses negative squared L2 distance on projection-head embeddings.
+        """Multi-positive InfoNCE (NT-Xent) contrastive loss with projection
+        head on hidden states.
 
         Architecture (SimCLR-style):
-          hidden state (d_model) -> projection head -> embedding (64-d) -> contrastive loss
+          hidden state (d_model) -> projection head -> L2-normalized embedding
+          -> cosine similarity -> temperature-scaled softmax -> NLL of positives.
 
-        Positives: same input through different specialists (M-1 positives, all targeted).
-        Negatives: different inputs through all specialists (M*(B-1) negatives).
+        For student specialist ``i`` on batch of unsup inputs of size B:
+          - Positives: same input b through each other specialist j != i.
+                       (M-1 positives per anchor.)
+          - Negatives: different inputs b' through other specialists j != i.
+                       ((M-1)*(B-1) negatives per anchor.)
+
+        The student's own block (j == i) is excluded from the similarity
+        matrix entirely. Including it would (a) push the student's embeddings
+        for different inputs apart -- actively harmful when many inputs share
+        an answer, and (b) create double-sided gradients on those pairs
+        because the student side is not detached.
+
+        With M < 2 there are no positives; returns 0 in that case so the
+        caller does not need to special-case it.
         """
-        B = all_unsup_logits[0].shape[0]
         M = self.M
+        if M < 2:
+            return torch.tensor(0.0, device=self.device, requires_grad=True)
+
+        B = all_unsup_hidden[0].shape[0]
         T = self.infonce_temp
 
-        # Extract answer-position hidden states and project through heads
-        # Student (i) keeps gradients; teachers (j != i) are detached
-        all_embeds = []
+        # Project answer-position hidden state through each specialist's head.
+        # Student (i) keeps grad; teachers (j != i) are stop-gradient.
+        embeds: List[torch.Tensor] = []
         for j in range(M):
-            hidden_at_answer = all_unsup_hidden[j][:, self.answer_pos, :].float()
-            # Project from d_model -> 64-d
-            emb = self.proj_heads[j](hidden_at_answer)
+            h = all_unsup_hidden[j][:, self.answer_pos, :].float()
+            e = self.proj_heads[j](h)
             if j != i:
-                emb = emb.detach()
-            # L2-normalize for cosine similarity
-            all_embeds.append(F.normalize(emb, dim=-1))
+                e = e.detach()
+            embeds.append(F.normalize(e, dim=-1))
 
-        embed_i = all_embeds[i]  # [B, 64]
+        z_i = embeds[i]  # [B, D]
+        # Concatenate only the teacher views; drop the student's own block.
+        others = torch.cat(
+            [embeds[j] for j in range(M) if j != i], dim=0
+        )  # [(M-1)*B, D]
 
-        # Build all similarity scores: [B, M*B]
-        # sim = -||embed_i[b] - embed_j[b']||^2 (higher = more similar)
-        all_sims = []
-        for j in range(M):
-            dist_sq = torch.cdist(embed_i, all_embeds[j], p=2).pow(2)
-            sim_matrix = -dist_sq
-            all_sims.append(sim_matrix)
+        # Cosine similarity (unit vectors) scaled by temperature.
+        sims = (z_i @ others.t()) / T  # [B, (M-1)*B]
+        log_prob = F.log_softmax(sims, dim=-1)
 
-        all_sims = torch.cat(all_sims, dim=1)  # [B, M*B]
-
-        # Mask out self-pair (i, b) for each row b
-        self_cols = torch.arange(B, device=embed_i.device) + i * B
-        all_sims[torch.arange(B), self_cols] = float("-inf")
-
-        # Multi-positive InfoNCE: average negative log-prob over all M-1 positives
-        logits = all_sims / T
-        log_softmax = F.log_softmax(logits, dim=-1)
-
-        loss = torch.tensor(0.0, device=embed_i.device)
-        for j in range(M):
-            if j != i:
-                pos_cols = torch.arange(B, device=embed_i.device) + j * B
-                loss = loss - log_softmax[torch.arange(B), pos_cols].mean()
-        loss = loss / (M - 1)
-
-        return loss
+        # Column layout of ``others``: blocks of size B for each j != i,
+        # in the order produced by the comprehension above. For view index
+        # ``k`` (0..M-2) the positive for anchor b sits at column k*B + b.
+        arange_B = torch.arange(B, device=z_i.device)
+        pos_losses: List[torch.Tensor] = []
+        for k in range(M - 1):
+            pos_cols = arange_B + k * B
+            pos_losses.append(-log_prob[arange_B, pos_cols].mean())
+        return torch.stack(pos_losses).mean()
 
     def _consistency_loss(
         self, all_unsup_logits: List[torch.Tensor], all_unsup_hidden: List[torch.Tensor], i: int
