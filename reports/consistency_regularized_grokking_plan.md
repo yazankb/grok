@@ -174,6 +174,52 @@ Additionally, the v1 pilot was missing the **single-model-on-50%** baseline, wit
 
 Decision rules for v2 results are the same as the original §7.5 table, but now interpretable against the single-model baseline rather than in a vacuum.
 
+### 8.2 Pilot v2 results and pilot v3 extensions
+
+Pilot v2 finished cleanly. Headline numbers (best val acc over 25k steps):
+
+| cell | single val | ensemble val | best specialist |
+|---|---|---|---|
+| `single_model_50pct` | 11.78% | — | — |
+| `multi_lam0` | — | 1.37% | 1.72% |
+| `multi_kl_lam01_warm5k` (full_grid) | — | 11.93% | 13.63% |
+| `multi_kl_lam1_warm5k` (full_grid) | — | 8.12% | 7.90% |
+| `multi_kl_lam01_warm5k_trainonly` | — | **21.15%** | **29.00%** |
+
+Two takeaways: (i) `train_inputs_only` consistency substantially beats `full_grid` at the same $\lambda$, consistent with a co-training interpretation where specialists pass each other information about their own shards rather than collapsing to agreement on held-out inputs; (ii) even the best v2 cell is far from grokking (~100%), so the question was whether v2 was seed-lucky / budget-limited / lambda-suboptimal, or whether the setup has an actual ceiling below grokking.
+
+Pilot v3 (9 cells, ~8h 30m on T4) answered each of those:
+
+- **Seed robustness (4 cells, lam=0.1, 25k, seeds 42-45):** ensemble val acc came in at 21 / 39 / 45 / 38 percent (mean 36%, median 39%). The v2 21% was a low outlier; the effect is real and robust.
+- **Single-model budget probe (1 cell, 100k steps):** plateaus at ~12% val acc around 24k steps and does not climb afterwards. The 12% ceiling is **architectural**, not budget-limited.
+- **Multi-model budget probe (1 cell, seed 42, lam=0.1, 100k steps):** climbs monotonically: 21% (25k) → 31% (50k) → 34.5% (75k) → 38% (100k). Slope still positive at the end, so the headline is not immediately capped by budget.
+- **Lambda ablation (3 cells at seed 42, 25k, on `train_inputs_only`):** ensemble val acc is monotonic in $\lambda$ over $[0.03, 1.0]$ — 16 / 21 / 26 / 27 percent at $\lambda \in \{0.03, 0.1, 0.3, 1.0\}$.
+
+Mechanistically, across all multi cells: output entropy dropped from $\log 97 \approx 4.6$ nats to ~1.3-2.0 nats (peaked but not collapsed), pairwise KL on val *rose* rather than fell (specialists differentiate, not collapse), and weight merging remained broken (merged model near-random). This rules out the trivial-agreement collapse mode from §5.2 and is consistent with genuine co-training.
+
+The open question at the end of v3 is the *ceiling*. The v3 probes were never run at the best-seed × best-lambda × full-budget corner of the configuration space. Pilot v4 fills that gap.
+
+### 8.3 Pilot v4 (final)
+
+v4 is three cells, all at 100k steps, all on `train_inputs_only` KL-softmax + 5k warmup, varying only seed and $\lambda$:
+
+| # | cell | seed | $\lambda_{\max}$ | steps | purpose |
+|---|---|---|---|---|---|
+| 1 | `seed44_lam1_100k` | 44 | 1.0 | 100k | primary bet: best seed × best lambda × full budget |
+| 2 | `seed43_lam1_100k` | 43 | 1.0 | 100k | cross-seed replication of (1) |
+| 3 | `seed44_lam01_100k` | 44 | 0.1 | 100k | lambda ablation at the winning seed, full budget |
+
+Seed 44 was the v3 seed-robustness winner (45% ensemble val acc at 25k). $\lambda=1.0$ was the v3 lambda-ablation winner (27% at seed 42, 25k, vs 21% at $\lambda=0.1$) and its curve had the steepest late-run slope of any ablation cell. Cell 1 therefore combines the best observed setting on every axis we have data for.
+
+**Decision rules for v4:**
+
+- If cell 1 reaches ≥90% ensemble val acc, the multi-specialist + `train_inputs_only` consistency recipe *enables grokking* in a regime where single-model is architecturally capped at 12%. Strong claim.
+- If cell 1 reaches 50-90%, the recipe substantially lifts val acc without crossing the phase transition; we have a quantitative "non-grokking improvement" result with a 5-7× lift over the single-model ceiling.
+- If cell 1 finishes below 50%, the recipe has a ceiling well below grokking on this task.
+- Cell 2 tests whether (1)'s outcome is seed-44-specific. Cell 3 isolates the lambda contribution at the 100k budget: if cell 1 ≫ cell 3, the lambda effect compounds with budget; if cell 1 ≈ cell 3, v3's monotone-in-lambda result was a transient that longer training erases.
+
+v4 is the last planned experiment; whichever outcome obtains, the next step is write-up, not another pilot.
+
 ## 9. Implementation plan
 
 The code changes needed live in `grok/multi_training.py` and `scripts/train_multi.py`. Sketch:

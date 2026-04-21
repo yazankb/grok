@@ -5,45 +5,43 @@ Runs a configurable list of cells (each cell = one full training run) and
 writes a top-level ``sweep_summary.json`` indexing all per-run results. Each
 cell creates its own subdirectory under ``--logdir/<sweep_name>/<cell_name>``.
 
-Default pilot is v3 (see ``reports/consistency_regularized_grokking_plan.md``
-§8 revision). Based on the v2 results the headline finding was that
-``train_inputs_only`` KL-softmax consistency at lambda=0.1 (21% ensemble val
-acc, best specialist 29%) substantially beats both the single-model-on-50%
-baseline (12%) and the multi-specialist-no-consistency baseline (1.4%) at
-25k steps. v3 is three micro-sweeps on that winning configuration:
+Default pilot is v4 (see ``reports/consistency_regularized_grokking_plan.md``
+§8 revision). Based on the v2 and v3 results:
 
-    [seed robustness, 4 cells]
-    1. ``seed42_trainonly_lam01``  - reruns the pilot_v2 winner (seed 42).
-    2. ``seed43_trainonly_lam01``  - same config, seed 43.
-    3. ``seed44_trainonly_lam01``  - same config, seed 44.
-    4. ``seed45_trainonly_lam01``  - same config, seed 45. Together these
-       decide whether the 21% result is a real effect or an init lottery
-       driven by whichever specialist seed landed in a lucky basin.
+- Single-model baseline on the 50% slice is architecturally capped at ~12%
+  val acc (confirmed at 100k steps, not budget-limited).
+- ``train_inputs_only`` KL-softmax consistency with 5k warmup is robust:
+  4/4 v3 seeds gave 21-45% ensemble val acc at 25k (mean 36%), vs 12%
+  single-model and 1.4% no-consistency.
+- The v3 long multi cell (seed 42, lam=0.1, 100k steps) kept climbing
+  throughout: 21% (25k) -> 31% (50k) -> 34.5% (75k) -> 38% (100k).
+- At seed 42 and 25k steps, ensemble val acc is monotonic in lambda over
+  [0.03, 1.0]: 16% / 21% / 26% / 27% for lam in {0.03, 0.1, 0.3, 1.0}.
 
-    [longer runs, 2 cells at 100k steps]
-    5. ``long_single_50pct_100k``  - single-model baseline at 100k steps.
-                                   Checks whether the 12% plateau at 25k
-                                   is budget-limited (still climbing) or
-                                   architectural (would need a different
-                                   recipe to grok at all). 100k is ~4x
-                                   the grokking-transition budget reported
-                                   in the original grokking paper.
-    6. ``long_trainonly_lam01_100k`` - winning config at 100k steps.
-                                   Checks whether val acc keeps climbing
-                                   past 25k or plateaus.
+v4 is our final sweep. The open question is whether the
+best-seed x best-lambda x full-budget configuration can cross the
+grokking phase transition (~100% val acc), or whether it asymptotes
+below. We also replicate at a second seed to confirm robustness.
 
-    [lambda ablation on train_inputs_only, 3 cells]
-    7. ``trainonly_lam003``        - same config as winner but lam=0.03.
-    8. ``trainonly_lam03``         - lam=0.3.
-    9. ``trainonly_lam10``         - lam=1.0. (lam=0.1 is covered by cell 1.)
+    [3 cells, all at 100k steps, all at ``train_inputs_only``]
+    1. ``seed44_lam1_100k`` - best-known seed x largest-known-good lambda
+       x full budget. Primary bet on grokking.
+    2. ``seed43_lam1_100k`` - cross-seed replication of (1). Tests
+       whether any grokking we see is seed-44-specific.
+    3. ``seed44_lam01_100k`` - lambda ablation at the winning seed.
+       Directly compares against (1) to quantify the lambda contribution
+       at the 100k budget (v3's lambda sweep was only at 25k, seed 42).
 
 Example (Kaggle, T4 GPU)::
 
     python scripts/run_consistency_sweep.py \
-        --sweep_name pilot_v3 \
+        --sweep_name pilot_v4 \
         --logdir /kaggle/working/consistency_runs \
         --consistency_steps 25000 \
         --gpu 0
+
+Each cell sets its own ``consistency_steps`` (100k in v4) so the CLI
+``--consistency_steps`` value only applies to cells that don't override.
 
 Custom cells via JSON file::
 
@@ -76,7 +74,7 @@ from typing import Any, Dict, List, Optional
 def _make_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description=__doc__)
     # Sweep metadata
-    p.add_argument("--sweep_name", type=str, default="pilot_v3",
+    p.add_argument("--sweep_name", type=str, default="pilot_v4",
                    help="Top-level subdirectory name for this sweep.")
     p.add_argument("--cells_json", type=str, default=None,
                    help="Optional path to a JSON list of cell-overrides "
@@ -119,88 +117,52 @@ def _make_parser() -> argparse.ArgumentParser:
     return p
 
 
-# Pilot sweep v3: 9 runs, three micro-sweeps on the pilot_v2 winner
-# (multi_kl_lam01_warm5k_trainonly: KL-softmax, lam=0.1, 5k warmup,
-# train_inputs_only). See the module docstring for the rationale and the
-# "winner" reference in reports/consistency_regularized_grokking_plan.md.
-_WINNER_BASE: Dict[str, Any] = {
+# Pilot sweep v4: 3 runs, final experiment. All cells use 100k steps and
+# the train_inputs_only KL-softmax consistency domain with 5k warmup. The
+# cells differ only in (random_seed, lambda). See the module docstring
+# for the rationale and the v1-v3 history in the plan §8 revision.
+_V4_BASE: Dict[str, Any] = {
     "consistency_loss": "kl_softmax",
-    "consistency_lambda": 0.1,
     "consistency_warmup_steps": 5000,
     "consistency_domain": "train_inputs_only",
+    "consistency_steps": 100000,
 }
 
 DEFAULT_PILOT_CELLS: List[Dict[str, Any]] = [
-    # --- 1-4: seed robustness on the winning config -----------------------
     {
-        "name": "seed42_trainonly_lam01",
-        "description": "Seed 42 (pilot_v2 winner). Establishes the anchor "
-                       "for the 3 additional-seed reruns in cells 2-4.",
-        "random_seed": 42,
-        **_WINNER_BASE,
-    },
-    {
-        "name": "seed43_trainonly_lam01",
-        "description": "Seed 43 of the winning config. Different shard "
-                       "permutation and different specialist inits.",
-        "random_seed": 43,
-        **_WINNER_BASE,
-    },
-    {
-        "name": "seed44_trainonly_lam01",
-        "description": "Seed 44 of the winning config.",
+        "name": "seed44_lam1_100k",
+        "description": "Primary bet. Best-known seed from v3 (seed 44, "
+                       "which gave 45% ensemble val acc at 25k with "
+                       "lam=0.1) combined with the largest-known-good "
+                       "lambda (lam=1.0, monotonic winner of v3's lambda "
+                       "ablation) at the full 100k budget. If this cell "
+                       "does not cross the grokking phase transition "
+                       "(~100% val acc), nothing at this scale will.",
         "random_seed": 44,
-        **_WINNER_BASE,
+        "consistency_lambda": 1.0,
+        **_V4_BASE,
     },
     {
-        "name": "seed45_trainonly_lam01",
-        "description": "Seed 45 of the winning config. If all four seeds "
-                       "produce 15-25% ensemble val acc with a ~25-30% "
-                       "breakout specialist, the co-training story is real.",
-        "random_seed": 45,
-        **_WINNER_BASE,
-    },
-    # --- 5-6: longer runs (100k steps) -----------------------------------
-    {
-        "name": "long_single_50pct_100k",
-        "description": "Single-model on the 50% slice, 100k steps. Tells us "
-                       "whether single-model-12%-at-25k is budget-limited "
-                       "(keeps climbing) or architectural (plateaued). 100k "
-                       "is ~4x the budget at which the original grokking "
-                       "paper reports its transition on modular arithmetic.",
-        "kind": "single_model",
-        "consistency_loss": "none",
-        "consistency_lambda": 0.0,
-        "consistency_warmup_steps": 0,
-        "consistency_domain": "full_grid",
-        "consistency_steps": 100000,
+        "name": "seed43_lam1_100k",
+        "description": "Cross-seed replication of cell 1. Seed 43 gave "
+                       "39% ensemble val acc at 25k with lam=0.1 (second "
+                       "best in v3). If cells 1 and 2 both grok, the "
+                       "effect is robust across seeds at the best lambda.",
+        "random_seed": 43,
+        "consistency_lambda": 1.0,
+        **_V4_BASE,
     },
     {
-        "name": "long_trainonly_lam01_100k",
-        "description": "Winning config at 100k steps. Tells us whether the "
-                       "21%-at-25k result keeps climbing or plateaus.",
-        "consistency_steps": 100000,
-        **_WINNER_BASE,
-    },
-    # --- 7-9: lambda ablation on train_inputs_only ------------------------
-    {
-        "name": "trainonly_lam003",
-        "description": "Winning config but lam=0.03. Probes the weak-lambda "
-                       "tail to see whether less consistency also works.",
-        **{**_WINNER_BASE, "consistency_lambda": 0.03},
-    },
-    {
-        "name": "trainonly_lam03",
-        "description": "Winning config but lam=0.3. Probes the midpoint.",
-        **{**_WINNER_BASE, "consistency_lambda": 0.3},
-    },
-    {
-        "name": "trainonly_lam10",
-        "description": "Winning config but lam=1.0. Strong-consistency bound "
-                       "on train_inputs_only. Compare against the lam=1.0 "
-                       "full-grid cell from pilot_v2 to isolate the domain "
-                       "effect at high lambda.",
-        **{**_WINNER_BASE, "consistency_lambda": 1.0},
+        "name": "seed44_lam01_100k",
+        "description": "Lambda ablation at the winning seed. Compare "
+                       "against cell 1 (seed44_lam1_100k) to quantify "
+                       "how much of any v4 gain comes from lambda vs "
+                       "seed. v3's lambda sweep was only at 25k steps "
+                       "and seed 42, so this is the first 100k-budget "
+                       "direct comparison.",
+        "random_seed": 44,
+        "consistency_lambda": 0.1,
+        **_V4_BASE,
     },
 ]
 
