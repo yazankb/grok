@@ -109,6 +109,8 @@ def _make_parser() -> argparse.ArgumentParser:
     p.add_argument("--weight_noise", type=float, default=0.0)
     # Trainer
     p.add_argument("--consistency_steps", type=int, default=25000)
+    p.add_argument("--infonce_temperature", type=float, default=0.1,
+                   help="Temperature for InfoNCE contrastive loss.")
     p.add_argument("--shard_batch_size", type=int, default=256)
     p.add_argument("--consistency_batch_size", type=int, default=256)
     p.add_argument("--eval_every", type=int, default=500)

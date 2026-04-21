@@ -157,9 +157,9 @@ class ConsistencyTrainer:
     ) -> None:
         assert len(specialists) == len(shards)
         assert len(specialists) >= 1, "Need at least one specialist."
-        if consistency_loss not in ("none", "mse_logits", "kl_softmax"):
+        if consistency_loss not in ("none", "mse_logits", "kl_softmax", "infonce"):
             raise ValueError(f"Unknown consistency_loss: {consistency_loss!r}")
-        if len(specialists) == 1 and consistency_loss != "none":
+        if len(specialists) == 1 and consistency_loss not in ("none", "infonce"):
             raise ValueError(
                 "Consistency loss requires M >= 2 specialists; got M=1 with "
                 f"consistency_loss={consistency_loss!r}. Use consistency_loss='none' "
@@ -187,6 +187,7 @@ class ConsistencyTrainer:
         self.eval_every = int(eval_every)
         self.checkpoint_every = int(checkpoint_every)
         self.log_every = int(log_every)
+        self.infonce_temp = getattr(hparams, "infonce_temperature", 0.1)
 
         self.M = len(specialists)
         self.tokenizer = full_train_ds.tokenizer
@@ -301,8 +302,62 @@ class ConsistencyTrainer:
         return self.unsup_inputs[idx].to(self.device)
 
     # ------------------------------------------------------------------
-    # Loss
+# Loss
     # ------------------------------------------------------------------
+
+    def _infonce_loss(
+        self, all_unsup_logits: List[torch.Tensor], i: int
+    ) -> torch.Tensor:
+        """
+        InfoNCE-style contrastive loss with L2 distance for multi-specialist alignment.
+
+        For each sample b in batch:
+        - Positive: same input through other specialists -> L2 squared distance minimized
+        - Negative: same specialist on different samples -> pushed apart via softmax
+
+        View embeddings as shape [B, M] where B=batch, M=num_specialists.
+        We contrast: (spec_i on sample_b) should be similar to (spec_j on sample_b) for j!=i
+                    but different from (spec_i on sample_k) for k!=b
+        """
+        B = all_unsup_logits[0].shape[0]
+        M = self.M
+        T = self.infonce_temp
+
+        all_embeds = [
+            all_unsup_logits[j][:, self.answer_pos, :] for j in range(M)
+        ]
+
+        embed_i = all_embeds[i]
+
+        pos_scores = []
+        for j in range(M):
+            if j == i:
+                continue
+            dist_sq = (embed_i - all_embeds[j]).pow(2).sum(dim=-1)
+            pos_scores.append(-dist_sq)
+        pos_scores = torch.stack(pos_scores, dim=1)
+
+        all_neg_scores_list = []
+
+        neg_mask = torch.ones(B, B, dtype=torch.bool, device=embed_i.device)
+        neg_mask.fill_diagonal_(False)
+        neg_dists_sq = (embed_i.unsqueeze(1) - embed_i.unsqueeze(0)).pow(2).sum(dim=-1)
+        neg_i_on_diff = -neg_dists_sq.masked_fill(~neg_mask, float('-inf'))
+        all_neg_scores_list.append(neg_i_on_diff)
+
+        for j in range(M):
+            if j == i:
+                continue
+            embed_j = all_embeds[j]
+            neg_dists_other = (embed_i.unsqueeze(1) - embed_j.unsqueeze(0)).pow(2).sum(dim=-1)
+            all_neg_scores_list.append(-neg_dists_other)
+
+        neg_scores = torch.cat(all_neg_scores_list, dim=1)
+
+        logits = torch.cat([pos_scores, neg_scores], dim=1) / T
+
+        labels = torch.zeros(B, dtype=torch.long, device=embed_i.device)
+        return F.cross_entropy(logits, labels)
 
     def _consistency_loss(
         self, all_unsup_logits: List[torch.Tensor], i: int
@@ -316,18 +371,16 @@ class ConsistencyTrainer:
         ]
         student_ans = all_unsup_logits[i][:, self.answer_pos, :]
         if self.consistency_loss == "mse_logits":
-            # Mean of detached other logits, then MSE (classic Mean Teacher).
             teacher_ans = torch.stack(others_logits, dim=0).mean(dim=0)
             return F.mse_loss(student_ans, teacher_ans)
         if self.consistency_loss == "kl_softmax":
-            # Average softmaxes of detached others (Hinton-style multi-teacher).
-            # softmax(mean(logits)) sharpens consensus; mean(softmax(logits))
-            # preserves per-teacher confidence and is the standard choice.
             teacher_p = torch.stack(
                 [F.softmax(o, dim=-1) for o in others_logits], dim=0
             ).mean(dim=0)
             student_log = F.log_softmax(student_ans, dim=-1)
             return F.kl_div(student_log, teacher_p, reduction="batchmean")
+        if self.consistency_loss == "infonce":
+            return self._infonce_loss(all_unsup_logits, i)
         raise RuntimeError(f"Unhandled consistency_loss: {self.consistency_loss}")
 
     # ------------------------------------------------------------------
@@ -771,9 +824,15 @@ def add_consistency_args(parser: ArgumentParser) -> ArgumentParser:
         "--consistency_loss",
         type=str,
         default="mse_logits",
-        choices=["none", "mse_logits", "kl_softmax"],
+        choices=["none", "mse_logits", "kl_softmax", "infonce"],
         help="Pairwise consistency loss between specialists, evaluated at "
-             "the answer-prediction position.",
+             "the answer-prediction position. 'infonce' uses contrastive loss.",
+    )
+    parser.add_argument(
+        "--infonce_temperature",
+        type=float,
+        default=0.1,
+        help="Temperature for InfoNCE loss (lower temp = sharper contrast).",
     )
     parser.add_argument(
         "--consistency_lambda",
