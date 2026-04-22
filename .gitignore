@@ -158,3 +158,35 @@ run_paper_exact.py
 scripts/plot_100steps.py
 
 reports/distillation*.md
+
+# -- Kaggle sweep outputs (raw CSVs + checkpoints; regenerate by rerunning the
+#    sweeps on Kaggle; too large to commit. Extracted copies live alongside
+#    their zipped archives.) --
+pilot_v1/
+pilot_v2/
+pilot_v3/
+pilot_v4/
+infonce_pilot_v3/
+lr_control/
+loss_control_kl/
+pilot_v1.zip
+pilot_v2.zip
+pilot_v3.zip
+pilot_v4.zip
+infonce_pilot_v3.zip
+lr_control.zip
+loss_control_kl.zip
+kaggle.logs
+kaggle.json
+
+# -- LaTeX build artifacts (keep .tex and .pdf, drop the rest) --
+reports/*.aux
+reports/*.log
+reports/*.out
+reports/*.toc
+reports/*.fls
+reports/*.fdb_latexmk
+reports/*.synctex.gz
+
+# macOS cruft
+.DS_Store
