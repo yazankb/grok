@@ -119,13 +119,15 @@ ensemble val acc on a single axis.
 \centering
 \includegraphics[width=\linewidth]{fig_project_overview.png}
 \caption{\textbf{Project overview.} Every key trajectory in one plot.
-Grey dashed: single-model baseline on $50\%$ data, ceilings at
-$12.3\%$. Blue (light): v2 winner, $21.2\%$ at $25$k. Blue (dark):
-v4 winner, $49.3\%$ at $100$k (the apparent architectural ceiling).
-Purple: v5 InfoNCE long, $92.2\%$ at $99.5$k. Greens: the two
-isolation controls, both reach $100\%$, the lr control by changing
-only $\mathtt{max\_lr}$ relative to the v4 winner, the loss control
-by changing only the consistency loss relative to the v5 winner.}
+Grey dashed: single-model baseline on $50\%$ data, run to $100$k to
+confirm the $12.3\%$ ceiling is budget-exhausted (\S\ref{sec:v3},
+\texttt{pilot\_v3/long\_single\_50pct\_100k}). Blue (light): v2
+winner, $21.2\%$ at $25$k. Blue (dark): v4 winner, $49.3\%$ at
+$100$k (the apparent architectural ceiling). Purple: v5 InfoNCE long,
+$92.2\%$ at $99.5$k. Greens: the two isolation controls, both reach
+$100\%$, the lr control by changing only $\mathtt{max\_lr}$ relative
+to the v4 winner, the loss control by changing only the consistency
+loss relative to the v5 winner.}
 \label{fig:overview}
 \end{figure}
 

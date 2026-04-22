@@ -165,7 +165,7 @@ def fig_summary_bar_final():
 # --- Fig E: project overview (single plot, every key trajectory) -------
 def fig_project_overview():
     """One-panel trajectory view of the whole investigation, for §1."""
-    single = load("pilot_v2", "single_model_50pct")
+    single = load("pilot_v3", "long_single_50pct_100k")
     v2 = load("pilot_v2", "multi_kl_lam01_warm5k_trainonly")
     v4 = load("pilot_v4", "seed44_lam1_100k")
     infonce = load("infonce_pilot_v3", "infonce_long_100k")
@@ -176,7 +176,7 @@ def fig_project_overview():
 
     ax.plot(single["step"], single["val_acc_ensemble"], color="#636363",
             linewidth=1.2, linestyle="--",
-            label="single-model 50% (v2 baseline) -- 12.3%")
+            label="single-model 50%, 100k (v3 budget probe) -- 12.3%")
     ax.plot(v2["step"], v2["val_acc_ensemble"], color="#3182bd", linewidth=1.2,
             label="v2 KL train-only, 25k ($\\lambda{=}0.1$) -- 21.2%")
     ax.plot(v4["step"], v4["val_acc_ensemble"], color="#08519c", linewidth=1.6,
